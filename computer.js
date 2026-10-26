@@ -1,0 +1,5929 @@
+/* ==========================================================================
+   TANKE CORE · grammar → IR
+   A program is plain JavaScript. Calling the DSL functions records nodes.
+   app(title).add(...nodes) makes one app (space() is the same thing); finalize() resolves keys and
+   links, checks the program and emits the IR: a JSON DAG of nodes (cards,
+   layouts, streams), containment and link edges, parameters and the list
+   of lambdas with when they run. Nothing here draws; see TANKE CANVAS.
+   ========================================================================== */
+"use strict";
+const T = (window.Tanke = window.Tanke || {});
+
+/* ---------- small utilities ---------- */
+function fnv1a(str) { let h = 2166136261; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0).toString(16).padStart(8, "0").toUpperCase(); }
+function stable(o) {
+  if (o === null || typeof o !== "object") return JSON.stringify(o === undefined ? null : o);
+  if (Array.isArray(o)) return "[" + o.map(stable).join(",") + "]";
+  return "{" + Object.keys(o).sort().map(k => JSON.stringify(k) + ":" + stable(o[k])).join(",") + "}";
+}
+/* ---------- three-way merge: two people changed the same file at once ----------
+   merge3(base, mine, theirs) keeps both changes wherever they do not touch: text by lines (and by
+   words inside a line), lists and table rows by item, objects by key, records and shapes by id.
+   Where both changed the same spot, mine wins; where both added at the same spot, both stay. */
+const same = (a, b) => a === b || stable(a) === stable(b);
+const isPlain = v => v != null && typeof v === "object" && !Array.isArray(v);
+function lcsPairs(a, b) {
+  // a common head and tail are matched at once; the middle gets a small LCS table (a and b are keys, compared with ===)
+  let s = 0; while (s < a.length && s < b.length && a[s] === b[s]) s++;
+  let ea = a.length, eb = b.length; while (ea > s && eb > s && a[ea - 1] === b[eb - 1]) { ea--; eb--; }
+  const pairs = []; for (let i = 0; i < s; i++) pairs.push([i, i]);
+  const n = ea - s, m = eb - s;
+  if (n && m && n * m <= 2500000) {
+    const W = m + 1, L = new Uint32Array((n + 1) * W);
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i * W + j] = a[s + i] === b[s + j] ? L[(i + 1) * W + j + 1] + 1 : Math.max(L[(i + 1) * W + j], L[i * W + j + 1]);
+    let i = 0, j = 0; while (i < n && j < m) { if (a[s + i] === b[s + j]) { pairs.push([s + i, s + j]); i++; j++; } else if (L[(i + 1) * W + j] >= L[i * W + j + 1]) i++; else j++; }
+  }
+  for (let k = 0; k < a.length - ea; k++) pairs.push([ea + k, eb + k]);
+  return pairs;
+}
+function mergeSeq(o, a, b, deep) {
+  const key = x => typeof x === "string" ? "s" + x : stable(x), ko = o.map(key), ka = a.map(key), kb = b.map(key);
+  const ma = new Map(lcsPairs(ko, ka)), mb = new Map(lcsPairs(ko, kb)), out = [];
+  let io = 0, ia = 0, ib = 0;
+  for (;;) {
+    let s = io; while (s < o.length && !(ma.has(s) && mb.has(s) && ma.get(s) >= ia && mb.get(s) >= ib)) s++;
+    const ea = s < o.length ? ma.get(s) : a.length, eb = s < o.length ? mb.get(s) : b.length;
+    const O = o.slice(io, s), A = a.slice(ia, ea), B = b.slice(ib, eb), kO = ko.slice(io, s).join("\u0001"), kA = ka.slice(ia, ea).join("\u0001"), kB = kb.slice(ib, eb).join("\u0001");
+    if (kA === kO) out.push(...B);
+    else if (kB === kO || kA === kB) out.push(...A);
+    else if (!O.length) out.push(...A, ...B); // both added at the same spot: keep both
+    else if (deep && A.length === O.length && B.length === O.length) for (let k = 0; k < O.length; k++) out.push(deep(O[k], A[k], B[k]));
+    else {
+      // one side kept the spot and only added before or after it: the other side's change, plus that addition
+      const kOs = ko.slice(io, s), kAs = ka.slice(ia, ea), kBs = kb.slice(ib, eb), n = kOs.length;
+      const head = k => k.length > n && kOs.every((x, i) => k[i] === x), tail = k => k.length > n && kOs.every((x, i) => k[k.length - n + i] === x);
+      if (head(kBs)) out.push(...A, ...B.slice(n));
+      else if (tail(kBs)) out.push(...B.slice(0, B.length - n), ...A);
+      else if (head(kAs)) out.push(...B, ...A.slice(n));
+      else if (tail(kAs)) out.push(...A.slice(0, A.length - n), ...B);
+      else { const w = (A.length === O.length) !== (B.length === O.length) ? weave(O, A, B, A.length === O.length, deep) : null; out.push(...(w || A)); } // both changed the same spot: mine wins
+    }
+    if (s >= o.length) break;
+    out.push(a[ea]); io = s + 1; ia = ea + 1; ib = eb + 1;
+  }
+  return out;
+}
+/* one side changed items in place, the other added or removed some: walk the other side and keep both */
+function weave(O, A, B, mineInPlace, deep) {
+  const key = x => typeof x === "string" ? "s" + x : stable(x), other = mineInPlace ? B : A, fixed = mineInPlace ? A : B;
+  const pairs = new Map(lcsPairs(other.map(key), O.map(key)).map(([j, i]) => [j, i])), used = new Set(pairs.values()), out = [];
+  if (pairs.size !== O.length && pairs.size !== other.length) return null; // that side replaced items too: no clean weave
+  const pick = (i, x) => { const a = mineInPlace ? fixed[i] : x, b = mineInPlace ? x : fixed[i]; return deep ? deep(O[i], a, b) : same(a, O[i]) ? b : a; };
+  let next = 0;
+  other.forEach((x, j) => {
+    if (!pairs.has(j)) { out.push(x); return; } // added on that side
+    const i = pairs.get(j);
+    for (; next < i; next++) if (!used.has(next) && !same(fixed[next], O[next])) out.push(fixed[next]); // removed there, but changed here: keep
+    out.push(pick(i, x)); next = i + 1;
+  });
+  for (; next < O.length; next++) if (!used.has(next) && !same(fixed[next], O[next])) out.push(fixed[next]);
+  return out;
+}
+function mergeById(base, mine, theirs) {
+  const B = new Map(base.filter(isPlain).map(x => [x.id, x])), Tm = new Map(theirs.map(x => [x.id, x])), M = new Map(mine.map(x => [x.id, x])), out = [];
+  for (const x of mine) { const t = Tm.get(x.id), b = B.get(x.id); if (!t) { if (b && same(x, b)) continue; out.push(x); continue; } out.push(b ? merge3(b, x, t) : x); }
+  theirs.forEach((x, i) => {
+    if (M.has(x.id) || B.has(x.id)) return;
+    let at = 0; for (let k = i - 1; k >= 0; k--) { const p = out.findIndex(y => y.id === theirs[k].id); if (p >= 0) { at = p + 1; break; } }
+    out.splice(at, 0, x);
+  });
+  return out;
+}
+function merge3(base, mine, theirs) {
+  if (same(mine, theirs) || same(theirs, base)) return mine;
+  if (base === undefined) return mine;
+  if (same(mine, base)) return theirs;
+  if (typeof mine === "string" && typeof theirs === "string" && typeof base === "string") {
+    if (!/\n/.test(base + mine + theirs)) { const w = s => s.split(/(\s+)/); return mergeSeq(w(base), w(mine), w(theirs)).join(""); }
+    return mergeSeq(base.split("\n"), mine.split("\n"), theirs.split("\n"), (o, a, b) => typeof a === "string" && typeof b === "string" && typeof o === "string" ? merge3(o, a, b) : a).join("\n");
+  }
+  if (Array.isArray(mine) && Array.isArray(theirs) && Array.isArray(base)) {
+    const ided = x => x.length > 0 && x.every(v => isPlain(v) && typeof v.id === "string" && v.id);
+    if (ided(mine) && ided(theirs)) return mergeById(base, mine, theirs);
+    return mergeSeq(base, mine, theirs, merge3);
+  }
+  if (isPlain(mine) && isPlain(theirs)) {
+    const b = isPlain(base) ? base : {}, out = {};
+    const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+    for (const k of new Set(Object.keys(mine).concat(Object.keys(theirs), Object.keys(b)))) {
+      if (k === "__proto__") continue;
+      const inM = own(mine, k), inT = own(theirs, k), inB = own(b, k);
+      if (inM && inT) out[k] = merge3(inB ? b[k] : undefined, mine[k], theirs[k]);
+      else if (inM) { if (!(inB && same(mine[k], b[k]))) out[k] = mine[k]; } // they removed it: gone, unless I changed it
+      else if (inT && !inB) out[k] = theirs[k]; // they added it
+    }
+    return out;
+  }
+  return mine;
+}
+function lev(a, b) {
+  const m = a.length, n = b.length, d = Array.from({ length: m + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[m][n];
+}
+function closest(name, options) {
+  let best = null, bd = Infinity;
+  for (const o of options) { const d = lev(String(name).toLowerCase(), String(o).toLowerCase()); if (d < bd) { bd = d; best = o; } }
+  return bd <= Math.max(2, Math.floor(String(name).length / 3)) ? best : null;
+}
+const describe = v => { let s; try { s = typeof v === "function" ? "a function" : JSON.stringify(v); } catch (e) { s = String(v); } if (s === undefined) s = String(v); return s.length > 48 ? s.slice(0, 45) + "…" : s; };
+const slug = s => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "x";
+
+/* ---------- source positions ----------
+   Every node records the program line that made it, read from the stack.
+   LINE_BASE is calibrated so line 1 of the editor is line 1 here. */
+let LINE_BASE = 0;
+const POS_RE = /(?:<anonymous>|> Function|Function code):(\d+):(\d+)/;
+function here() { const m = (new Error().stack || "").match(POS_RE); return m ? { line: +m[1] - LINE_BASE, col: +m[2] } : { line: null, col: null }; }
+function posOfError(e) { const m = ((e && e.stack) || "").match(POS_RE); return m ? { line: +m[1] - LINE_BASE, col: +m[2] } : { line: null, col: null }; }
+
+/* ---------- errors: precise and actionable ---------- */
+class TankeError extends Error {
+  constructor(message, pos, hint, code) {
+    super(message); this.name = "TankeError";
+    this.line = pos && pos.line != null ? pos.line : null; this.col = pos && pos.col != null ? pos.col : null;
+    this.hint = hint || ""; this.code = code || "T-BUILD";
+  }
+  toJSON() { return { code: this.code, line: this.line, col: this.col, message: this.message, hint: this.hint, severity: "error" }; }
+}
+const fail = (msg, pos, hint, code) => { throw new TankeError(msg, pos || here(), hint, code); };
+
+/* ---------- vocabulary ---------- */
+const KINDS = ["note", "idea", "question", "decision", "task", "quote", "source"];
+const TONES = ["ink", "muted", "accent", "positive", "danger"];
+const AUTHORS = ["you", "claude", "agent", "any"];
+const FILTER_KEYS = ["kind", "tag", "by", "who", "text", "unsorted", "done", "last"];
+const STREAM_LAYOUTS = ["stack", "row", "grid", "cluster"];
+const LAYOUTS = ["zone", "stack", "row", "grid", "orbit", "tree", "cluster"];
+const FILE_TYPES = ["note", "doc", "list", "table", "data", "link", "page", "program", "app"];
+const FILES_FILTER_KEYS = ["type", "name", "tag", "placed"];
+
+/* ---------- live(): the explicit runtime-lambda wrapper ---------- */
+class Live { constructor(fn, pos) { this.fn = fn; this.src = String(fn); this.line = pos.line; } }
+function live(fn) {
+  if (typeof fn !== "function") fail(`live() takes a function, got ${describe(fn)}.`, here(), `Example: live(c => c.count({ kind: "idea" }) + " ideas")`, "T-LIVE");
+  return new Live(fn, here());
+}
+
+/* ---------- act(): the explicit event-lambda wrapper ---------- */
+class Act { constructor(fn, pos) { this.fn = fn; this.src = String(fn); this.line = pos.line; } }
+function act(fn) {
+  if (typeof fn !== "function") fail(`act() takes a function, got ${describe(fn)}.`, here(), `Example: act(c => c.write("Groceries", xs => xs.filter(x => !x.done)))`, "T-ACT");
+  return new Act(fn, here());
+}
+
+/* ---------- the build session ---------- */
+let CUR = null;
+function S() { if (!CUR) fail("Nodes can only be made while a program runs.", null, "Use Tanke.compile(code) or window.tanke.load(code).", "T-SESSION"); return CUR; }
+function newSession(paramValues) { return { seq: 0, nodes: [], byId: {}, space: null, links: [], params: null, paramValues: paramValues || {}, warnings: [], gen: [], used: false, files: {} }; }
+
+class Node {
+  constructor(type, cls, pos) {
+    const s = S();
+    this.id = "n" + s.seq++; this.type = type; this.cls = cls;
+    this.line = pos.line; this.col = pos.col;
+    this.props = {}; this.kids = []; this.attached = false; this.parent = null;
+    this.gen = s.gen.length ? Object.assign({}, s.gen[s.gen.length - 1]) : null;
+    s.nodes.push(this); s.byId[this.id] = this;
+  }
+}
+const isLayout = n => n.cls === "layout";
+
+/* text slots take a string, a number or live(…) */
+function textArg(v, owner, slot, required) {
+  if (v === undefined || v === null) { if (required) fail(`${owner.type}() needs its ${slot}.`, here(), `Example: ${owner.type}("…")`, "T-MISSING"); return undefined; }
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (v instanceof Live) return v;
+  if (typeof v === "function") fail(`${owner.type}.${slot} got a bare function.`, here(), `Say when it runs: ${owner.type}(live(c => …)) runs every frame. To compute it once while building, call the function.`, "T-BARE-FN");
+  if (v instanceof Node) fail(`${owner.type}.${slot} takes text, but got the ${v.type} node.`, here(), `Nodes go inside layouts (zone, stack, row, grid…), not into text.`, "T-NODE-IN-TEXT");
+  fail(`${owner.type}.${slot} takes text, got ${describe(v)}.`, here(), `Pass a string, a number or live(c => …).`, "T-TYPE");
+}
+function numOrLive(v, owner, slot) {
+  if (typeof v === "number" && isFinite(v)) return v;
+  if (v instanceof Live) return v;
+  if (typeof v === "function") fail(`${owner.type}.${slot}() got a bare function.`, here(), `Wrap it: .${slot}(live(c => …)).`, "T-BARE-FN");
+  fail(`${owner.type}.${slot}() takes a number or live(…), got ${describe(v)}.`, here(), `Example: .${slot}(${slot === "turn" ? "live(c => c.t * 0.1)" : "120"})`, "T-TYPE");
+}
+
+/* ---------- modifiers: return the node, so they chain ---------- */
+Object.assign(Node.prototype, {
+  at(x, y) {
+    if (x instanceof Live && y === undefined) { this.props.at = x; return this; }
+    if (typeof x === "function") fail(`.at() got a bare function.`, here(), `For a moving position: .at(live(c => [x, y])).`, "T-BARE-FN");
+    if (typeof x !== "number" || typeof y !== "number") fail(`.at(x, y) takes two numbers (canvas units), got ${describe(x)}, ${describe(y)}.`, here(), `Example: .at(480, 0). Or live(c => [x, y]) to move every frame.`, "T-TYPE");
+    this.props.at = [x, y]; return this;
+  },
+  key(k) {
+    if (typeof k !== "string" || !/^[A-Za-z][\w-]*$/.test(k)) fail(`.key() takes a name like "why", got ${describe(k)}.`, here(), `Keys are letters, digits, _ and -. Link to it with link("#why", …).`, "T-KEY");
+    this.props.key = k; return this;
+  },
+  tone(t) {
+    if (t instanceof Live) { this.props.tone = t; return this; }
+    if (typeof t === "function") fail(`.tone() got a bare function.`, here(), `Wrap it: .tone(live(c => …)).`, "T-BARE-FN");
+    if (!TONES.includes(t)) fail(`Unknown tone ${describe(t)}.`, here(), `Tones: ${TONES.join(", ")}.${closest(t, TONES) ? ` Did you mean "${closest(t, TONES)}"?` : ""}`, "T-TONE");
+    this.props.tone = t; return this;
+  },
+  tag(...tags) {
+    for (const t of tags) if (typeof t !== "string" || !/^[\w-]+$/.test(t)) fail(`.tag() takes words like "risk", got ${describe(t)}.`, here(), `Write tags without "#".`, "T-TAG");
+    this.props.tags = (this.props.tags || []).concat(tags); return this;
+  },
+  w(n) { this.props.w = numArg(n, this, "w"); return this; },
+  h(n) { this.props.h = numArg(n, this, "h"); return this; },
+  gap(n) { this.props.gap = numArg(n, this, "gap"); return this; },
+  dim(b) {
+    if (b instanceof Live || typeof b === "boolean") { this.props.dim = b; return this; }
+    fail(`.dim() takes true/false or live(…).`, here(), `Example: .dim(live(c => !c.focus))`, "T-TYPE");
+  },
+  cols(n) {
+    if (this.type !== "grid" && this.type !== "stream") fail(`.cols() is for grid and stream, not ${this.type}.`, here(), `Use grid(cols, …) or stream(…).cols(2).`, "T-MODIFIER");
+    this.props.cols = Math.max(1, Math.floor(numArg(n, this, "cols"))); if (this.type === "stream") this.props.layout = "grid"; return this;
+  },
+  layout(kind) {
+    if (this.type !== "stream") fail(`.layout() is for stream(), not ${this.type}.`, here(), `Arrange authored nodes with stack, row, grid or cluster.`, "T-MODIFIER");
+    if (!STREAM_LAYOUTS.includes(kind)) fail(`stream().layout(${describe(kind)}) is not a layout.`, here(), `Layouts: ${STREAM_LAYOUTS.join(", ")}.${closest(kind, STREAM_LAYOUTS) ? ` Did you mean "${closest(kind, STREAM_LAYOUTS)}"?` : ""}`, "T-LAYOUT");
+    this.props.layout = kind; return this;
+  },
+  style(lv) {
+    if (this.type !== "stream") fail(`.style() is for stream(), not ${this.type}.`, here(), ``, "T-MODIFIER");
+    if (!(lv instanceof Live)) fail(typeof lv === "function" ? `.style() got a bare function.` : `.style() takes live((t, c) => ({ tone, dim })).`, here(), `It runs at runtime for every captured thought: .style(live((t, c) => ({ tone: t.tags.includes("hot") ? "accent" : null })))`, typeof lv === "function" ? "T-BARE-FN" : "T-TYPE");
+    this.props.style = lv; return this;
+  },
+  turn(v) {
+    if (this.type !== "orbit") fail(`.turn() is for orbit(), not ${this.type}.`, here(), ``, "T-MODIFIER");
+    this.props.turn = numOrLive(v, this, "turn"); return this;
+  },
+});
+function numArg(v, node, m) { if (typeof v !== "number" || !isFinite(v)) fail(`${node.type}.${m}() takes a number, got ${describe(v)}.`, here(), `Example: .${m}(${m === "gap" ? 12 : 240})`, "T-TYPE"); return v; }
+
+/* ---------- layout slots ---------- */
+function flat(a, out = []) { for (const x of a) Array.isArray(x) ? flat(x, out) : out.push(x); return out; }
+function kidsOf(list, owner) {
+  const out = [];
+  for (const k of flat(list)) {
+    if (k === null || k === undefined || k === false || k === true || k === "") continue;
+    if (k instanceof Node) {
+      if (k.cls === "link") { k.attached = true; S().links.push(k); continue; }
+      if (k.attached) fail(`This ${k.type} (line ${k.line}) is already placed somewhere else.`, here(), `A node sits in one place. To make copies, wrap it in a function and call it twice: const Card = t => note(t).`, "T-REUSED");
+      k.attached = true; k.parent = owner.id; out.push(k.id); continue;
+    }
+    if (typeof k === "string" || typeof k === "number" || k instanceof Live) { const n = DSL.note(typeof k === "number" ? String(k) : k); n.attached = true; n.parent = owner.id; n.props.auto = true; out.push(n.id); continue; }
+    if (typeof k === "function") fail(`A function in a layout slot of ${owner.type}.`, here(), `Layouts take nodes. To make nodes while building, call it or use repeat(n, i => …). For runtime text: note(live(c => …)).`, "T-BARE-FN");
+    if (k instanceof Live) continue;
+    fail(`${owner.type} can't hold ${describe(k)}.`, here(), `Layouts take nodes, strings or numbers (which become notes).`, "T-TYPE");
+  }
+  return out;
+}
+
+/* ---------- the DSL surface ---------- */
+const DSL = {};
+DSL.live = live;
+function cardMaker(kind) {
+  return function (text) {
+    const n = new Node(kind, "card", here());
+    n.props.text = textArg(text, n, "text", true);
+    if (arguments.length > 1) fail(`${kind}(text) takes one argument, got ${arguments.length}.`, here(), `Chain modifiers instead: ${kind}("…").tone("accent").tag("risk")`, "T-ARITY");
+    return n;
+  };
+}
+DSL.note = cardMaker("note"); DSL.idea = cardMaker("idea"); DSL.question = cardMaker("question"); DSL.decision = cardMaker("decision");
+DSL.task = function (text, done) {
+  const n = new Node("task", "card", here());
+  n.props.text = textArg(text, n, "text", true);
+  if (done !== undefined) { if (typeof done !== "boolean" && !(done instanceof Live)) fail(`task(text, done) takes true/false as done, got ${describe(done)}.`, here(), `Example: task("Ship it", true)`, "T-TYPE"); n.props.done = done; }
+  return n;
+};
+DSL.quote = function (text, cite) { const n = new Node("quote", "card", here()); n.props.text = textArg(text, n, "text", true); if (cite !== undefined) n.props.cite = textArg(cite, n, "cite"); return n; };
+DSL.source = function (title, url) {
+  const n = new Node("source", "card", here()); n.props.text = textArg(title, n, "title", true);
+  if (url !== undefined) { if (typeof url !== "string" || !/^https?:\/\//.test(url)) fail(`source(title, url): url must start with http:// or https://, got ${describe(url)}.`, here(), ``, "T-TYPE"); n.props.url = url; }
+  return n;
+};
+DSL.heading = function (text) { const n = new Node("heading", "heading", here()); n.props.text = textArg(text, n, "text", true); return n; };
+DSL.value = function (label, v, opts) {
+  const n = new Node("value", "value", here()); n.props.text = textArg(label, n, "label", true);
+  if (v === undefined) fail(`value(label, v) needs a value.`, here(), `Example: value("Open questions", live(c => c.count({ kind: "question" })))`, "T-MISSING");
+  if (typeof v === "function") fail(`value() got a bare function.`, here(), `Wrap it: value("…", live(c => …)).`, "T-BARE-FN");
+  if (!(v instanceof Live) && typeof v !== "number" && typeof v !== "string") fail(`value() takes a number, text or live(…), got ${describe(v)}.`, here(), ``, "T-TYPE");
+  n.props.value = v;
+  if (opts !== undefined) { if (!opts || typeof opts !== "object") fail(`value()'s third argument is { suffix, digits }.`, here(), ``, "T-OPTION"); for (const k of Object.keys(opts)) { if (!["suffix", "digits"].includes(k)) fail(`value() has no option "${k}".`, here(), `Options: suffix, digits.`, "T-OPTION"); n.props[k] = opts[k]; } }
+  return n;
+};
+DSL.sketch = function (lv) {
+  const n = new Node("sketch", "sketch", here());
+  if (!(lv instanceof Live)) fail(typeof lv === "function" ? `sketch() takes live((g, c) => …), not a bare function.` : `sketch() needs a painter: sketch(live((g, c) => …)).`, here(), `It runs every frame: sketch(live((g, c) => g.circle(g.w / 2, g.h / 2, 20, "accent")))`, "T-BARE-FN");
+  n.props.paint = lv; return n;
+};
+function containerMaker(type) {
+  return function (...kids) { const n = new Node(type, "layout", here()); n.kids = kidsOf(kids, n); return n; };
+}
+DSL.stack = containerMaker("stack"); DSL.row = containerMaker("row"); DSL.cluster = containerMaker("cluster");
+DSL.grid = function (cols, ...kids) {
+  const n = new Node("grid", "layout", here());
+  if (typeof cols !== "number" || cols < 1) fail(`grid(cols, …) takes a column count first, got ${describe(cols)}.`, here(), `Example: grid(3, idea("A"), idea("B"))`, "T-ARITY");
+  n.props.cols = Math.floor(cols); n.kids = kidsOf(kids, n); return n;
+};
+DSL.zone = function (title, ...kids) {
+  const n = new Node("zone", "layout", here());
+  if (title instanceof Node || title === undefined) fail(`zone(title, …nodes) needs a title first.`, here(), `Example: zone("Questions", stream({ kind: "question" }))`, "T-MISSING");
+  n.props.title = textArg(title, n, "title", true); n.kids = kidsOf(kids, n); return n;
+};
+DSL.orbit = function (center, ...kids) {
+  const n = new Node("orbit", "layout", here());
+  if (center === undefined) fail(`orbit(center, …nodes) needs a center.`, here(), `Example: orbit(question("Why?"), "Cost", "Time", "Trust")`, "T-MISSING");
+  n.kids = kidsOf([center], n).concat(kidsOf(kids, n)); return n;
+};
+DSL.tree = function (root, ...kids) {
+  const n = new Node("tree", "layout", here());
+  if (root === undefined) fail(`tree(root, …children) needs a root.`, here(), `Example: tree(question("Why slow?"), "Cold cache", tree("Big images", "Resize"))`, "T-MISSING");
+  n.kids = kidsOf([root], n).concat(kidsOf(kids, n)); return n;
+};
+DSL.stream = function (filter) {
+  const n = new Node("stream", "stream", here());
+  const f = filter === undefined ? {} : filter;
+  if (!f || typeof f !== "object" || Array.isArray(f) || f instanceof Node || f instanceof Live) fail(`stream(filter) takes an object, like { kind: "idea" }.`, here(), `Filters: ${FILTER_KEYS.join(", ")}.`, "T-FILTER");
+  for (const k of Object.keys(f)) {
+    if (!FILTER_KEYS.includes(k)) fail(`stream() has no filter "${k}".`, here(), `Filters: ${FILTER_KEYS.join(", ")}.${closest(k, FILTER_KEYS) ? ` Did you mean "${closest(k, FILTER_KEYS)}"?` : ""}`, "T-FILTER");
+    const v = f[k];
+    if (k === "kind") { const ks = Array.isArray(v) ? v : [v]; for (const x of ks) if (!KINDS.includes(x)) fail(`Unknown kind ${describe(x)} in stream().`, here(), `Kinds: ${KINDS.join(", ")}.${closest(x, KINDS) ? ` Did you mean "${closest(x, KINDS)}"?` : ""}`, "T-FILTER"); }
+    if (k === "tag" && (typeof v !== "string" || !/^[\w-]+$/.test(v))) fail(`stream({ tag }) takes a word like "pricing", got ${describe(v)}.`, here(), `Write the tag without "#".`, "T-FILTER");
+    if (k === "by" && !AUTHORS.includes(v)) fail(`stream({ by }) is one of ${AUTHORS.join(", ")}, got ${describe(v)}.`, here(), ``, "T-FILTER");
+    if (k === "who" && (typeof v !== "string" || !/^(me|others|[A-Za-z0-9_-]{1,80})$/.test(v))) fail(`stream({ who }) is "me", "others" or a person's id, got ${describe(v)}.`, here(), `Example: stream({ who: "me" }) shows only the notes you wrote.`, "T-FILTER");
+    if ((k === "unsorted" || k === "done") && typeof v !== "boolean") fail(`stream({ ${k} }) takes true or false.`, here(), ``, "T-FILTER");
+    if (k === "last" && (typeof v !== "number" || v < 1)) fail(`stream({ last }) takes a positive number.`, here(), `Example: stream({ last: 5 }) shows the five newest thoughts.`, "T-FILTER");
+    if (k === "text" && typeof v !== "string") fail(`stream({ text }) takes a string to search for.`, here(), ``, "T-FILTER");
+  }
+  if (f.unsorted && Object.keys(f).some(k => k !== "unsorted" && k !== "last")) fail(`stream({ unsorted: true }) collects what no other stream claims, so it can't also filter.`, here(), `Use a separate stream for the filter.`, "T-FILTER");
+  n.props.filter = Object.assign({}, f); n.props.layout = "stack";
+  if (arguments.length > 1) fail(`stream(filter) takes one argument.`, here(), `Chain .layout("grid"), .cols(2) or .style(live(…)) instead.`, "T-ARITY");
+  return n;
+};
+DSL.link = function (a, b, label) {
+  const n = new Node("link", "link", here());
+  if (a === undefined || b === undefined) fail(`link(a, b, label?) needs two ends.`, here(), `Ends are nodes you hold in a const, or "#key" strings: link("#why", "#fix", "because")`, "T-LINK");
+  for (const [end, v] of [["from", a], ["to", b]]) {
+    if (v instanceof Node) { if (v.cls === "link") fail(`link() can't connect to another link.`, here(), ``, "T-LINK"); n.props[end] = v.id; }
+    else if (typeof v === "string" && /^#[A-Za-z][\w-]*$/.test(v)) n.props[end] = v;
+    else fail(`link() ends are nodes or "#key" strings, got ${describe(v)}.`, here(), `Give a node a key with .key("why"), then link("#why", …).`, "T-LINK");
+  }
+  if (label !== undefined) n.props.label = textArg(label, n, "label");
+  return n;
+};
+/* build-time structure: repeat runs its lambda now, once per element */
+DSL.repeat = function (src, fn) {
+  const pos = here(), s = S();
+  if (src instanceof Live || (src instanceof Node && src.type === "stream")) fail(`repeat() runs while building, but ${src instanceof Live ? "live(…)" : "stream()"} only has values at runtime.`, pos, `For captured thoughts use stream(filter). repeat takes a number or a literal array: repeat(3, i => …).`, "T-REPEAT-RUNTIME");
+  if (typeof fn !== "function") fail(`repeat() needs a lambda: repeat(n, (x, i) => node).`, pos, ``, "T-LAMBDA");
+  const arr = typeof src === "number" ? Array.from({ length: Math.max(0, Math.floor(src)) }, (_, i) => i) : src;
+  if (!Array.isArray(arr)) fail(`repeat() takes a number or an array, got ${describe(src)}.`, pos, ``, "T-TYPE");
+  const out = [];
+  arr.forEach((x, i) => { s.gen.push({ by: "repeat", line: pos.line, i, of: arr.length }); try { out.push(fn(x, i)); } finally { s.gen.pop(); } });
+  return out;
+};
+/* parameters: knobs in the panel; their values are plain JS while building */
+DSL.slider = (value, min, max, step) => {
+  for (const [k, x] of [["value", value], ["min", min], ["max", max]]) if (typeof x !== "number") fail(`slider(value, min, max, step?) needs numbers; ${k} is ${describe(x)}.`, here(), `Example: slider(3, 1, 6)`, "T-PARAM");
+  if (min >= max) fail(`slider(): min (${min}) must be below max (${max}).`, here(), ``, "T-PARAM");
+  return { control: "slider", value: Math.min(max, Math.max(min, value)), min, max, step: typeof step === "number" && step > 0 ? step : Number.isInteger(value) && Number.isInteger(min) ? 1 : (max - min) / 100 };
+};
+DSL.checkbox = value => { if (typeof value !== "boolean") fail(`checkbox(value) takes true or false, got ${describe(value)}.`, here(), ``, "T-PARAM"); return { control: "checkbox", value }; };
+DSL.choice = (value, options) => {
+  if (!Array.isArray(options) || !options.length || !options.every(o => typeof o === "string")) fail(`choice(value, options) needs a list of text options.`, here(), `Example: choice("all", ["all", "idea", "question"])`, "T-PARAM");
+  if (!options.includes(value)) fail(`choice(): "${value}" is not one of the options.`, here(), `Options: ${options.join(", ")}.`, "T-PARAM");
+  return { control: "choice", value, options };
+};
+DSL.field = value => { if (typeof value !== "string") fail(`field(value) takes text, got ${describe(value)}.`, here(), ``, "T-PARAM"); return { control: "field", value }; };
+DSL.params = function (spec) {
+  const s = S(), pos = here();
+  if (s.params) fail(`params() is already declared on line ${s.params.line}.`, pos, `Declare every knob in one params({ … }) call.`, "T-PARAM");
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) fail(`params({ name: slider(…) }) takes an object of knobs.`, pos, ``, "T-PARAM");
+  const list = [], values = {};
+  for (const [name, ctl] of Object.entries(spec)) {
+    if (!/^[A-Za-z_]\w*$/.test(name)) fail(`Knob name "${name}" must be an identifier.`, pos, ``, "T-PARAM");
+    if (["t", "dt", "frame", "count", "thoughts", "notes", "zoom", "selected", "params", "now", "file", "files", "write", "create", "run", "claude", "state", "set", "mine", "keep", "records", "add", "update", "remove", "make", "me", "people", "person", "my", "everyone", "setMy"].includes(name)) fail(`"${name}" is reserved on the runtime context (c.${name}).`, pos, `Pick another knob name.`, "T-PARAM");
+    if (!ctl || !ctl.control) fail(`Knob "${name}" must be slider(…), checkbox(…), choice(…) or field(…), got ${describe(ctl)}.`, pos, ``, "T-PARAM");
+    const given = s.paramValues[name];
+    const ok = given !== undefined && (ctl.control === "slider" ? typeof given === "number" && given >= ctl.min && given <= ctl.max : ctl.control === "checkbox" ? typeof given === "boolean" : ctl.control === "choice" ? ctl.options.includes(given) : typeof given === "string");
+    values[name] = ok ? given : ctl.value;
+    list.push(Object.assign({ name, line: pos.line, default: ctl.value }, ctl, { value: values[name] }));
+  }
+  s.params = { line: pos.line, list, values };
+  return Object.freeze(Object.assign({}, values));
+};
+
+/* ---------- files: apps read and change desktop files by name ---------- */
+const FILE_REF = Symbol("tanke.file");
+const SEEDS = { note: "", doc: "", list: [], table: { cols: ["A", "B"], rows: [["", ""]] }, data: {}, link: { url: "", title: "" }, page: "", program: "", app: "" };
+DSL.file = function (name, opts) {
+  const s = S(), pos = here();
+  if (typeof name !== "string" || !name.trim()) fail(`file(name) takes the file's name, like file("Groceries").`, pos, `Files are found by name on this desktop.`, "T-FILE");
+  const o = opts === undefined ? {} : opts;
+  if (!o || typeof o !== "object" || Array.isArray(o)) fail(`file("${name}", { type, seed }) takes an options object.`, pos, ``, "T-FILE");
+  for (const k of Object.keys(o)) if (!["type", "seed"].includes(k)) fail(`file() has no option "${k}".`, pos, `Options: type, seed.`, "T-FILE");
+  const type = o.type || (o.seed === undefined ? "data" : typeof o.seed === "string" ? "doc" : Array.isArray(o.seed) ? "list" : "data");
+  if (!FILE_TYPES.includes(type)) fail(`Unknown file type "${type}".`, pos, `Types: ${FILE_TYPES.join(", ")}.${closest(type, FILE_TYPES) ? ` Did you mean "${closest(type, FILE_TYPES)}"?` : ""}`, "T-FILE");
+  if (typeof o.seed === "function") fail(`file("${name}"): the seed must be a plain value.`, pos, ``, "T-FILE");
+  const ref = Object.freeze({ [FILE_REF]: true, name: name.trim(), type, seed: o.seed !== undefined ? o.seed : SEEDS[type], line: pos.line });
+  s.files[ref.name] = ref;
+  return ref;
+};
+const isFileRef = v => v != null && typeof v === "object" && !!v[FILE_REF];
+function fileArg(v, owner, want) {
+  if (typeof v === "string" && v.trim()) { const s = S(); return s.files[v.trim()] || (s.files[v.trim()] = Object.freeze({ [FILE_REF]: true, name: v.trim(), type: want, seed: SEEDS[want], line: here().line })); }
+  if (isFileRef(v)) {
+    if (want && v.type !== want && !(want === "doc" && v.type === "note")) fail(`${owner}() edits ${want} files, but file("${v.name}") is a ${v.type}.`, here(), `Use ${({ doc: "textedit", list: "checklist", table: "sheet", data: "inspect" })[v.type] || "inspect"}() for ${v.type} files, or declare file("${v.name}", { type: "${want}" }).`, "T-FILE");
+    return v;
+  }
+  fail(`${owner}() takes a file, like ${owner}(file("Notes")) or ${owner}("Notes").`, here(), `Declare it once: const notes = file("Notes", { type: "${want || "doc"}" })`, "T-FILE");
+}
+function editorMaker(name, type) {
+  return function (ref, opts) {
+    const n = new Node(name, "editor", here()), f = fileArg(ref, name, type);
+    n.props.file = { name: f.name, type: f.type, seed: f.seed };
+    if (opts !== undefined) { if (!opts || typeof opts !== "object") fail(`${name}()'s second argument is { placeholder }.`, here(), ``, "T-OPTION"); for (const k of Object.keys(opts)) { if (k !== "placeholder") fail(`${name}() has no option "${k}".`, here(), `Options: placeholder.`, "T-OPTION"); n.props.placeholder = String(opts[k]); } }
+    return n;
+  };
+}
+DSL.textedit = editorMaker("textedit", "doc");
+DSL.checklist = editorMaker("checklist", "list");
+DSL.sheet = editorMaker("sheet", "table");
+DSL.terminal = editorMaker("terminal", "program"); // a program's Run button and output, inside an app
+DSL.inspect = function (ref) { const n = new Node("inspect", "editor", here()), f = fileArg(ref, "inspect", null); n.props.file = { name: f.name, type: f.type, seed: f.seed }; return n; };
+DSL.files = function (filter) {
+  const n = new Node("files", "files", here()), f = filter === undefined ? {} : filter;
+  if (!f || typeof f !== "object" || Array.isArray(f)) fail(`files(filter) takes an object, like { type: "doc" }.`, here(), `Filters: ${FILES_FILTER_KEYS.join(", ")}.`, "T-FILTER");
+  for (const k of Object.keys(f)) {
+    if (!FILES_FILTER_KEYS.includes(k)) fail(`files() has no filter "${k}".`, here(), `Filters: ${FILES_FILTER_KEYS.join(", ")}.${closest(k, FILES_FILTER_KEYS) ? ` Did you mean "${closest(k, FILES_FILTER_KEYS)}"?` : ""}`, "T-FILTER");
+    if (k === "type") for (const t of [].concat(f.type)) if (!FILE_TYPES.includes(t)) fail(`Unknown file type ${describe(t)} in files().`, here(), `Types: ${FILE_TYPES.join(", ")}.`, "T-FILTER");
+  }
+  n.props.filter = Object.assign({}, f); return n;
+};
+function actArg(a, owner) {
+  if (a instanceof Act) return a;
+  if (typeof a === "function") fail(`${owner}() got a bare function.`, here(), `Say when it runs: ${owner}(…, act(c => …)) runs when someone uses it.`, "T-BARE-FN");
+  fail(`${owner}() needs an action: act(c => …).`, here(), `Example: button("Clear", act(c => c.write("Todo", [])))`, "T-ACT");
+}
+DSL.act = act;
+DSL.button = function (label, a) { const n = new Node("button", "button", here()); n.props.text = textArg(label, n, "label", true); n.props.act = actArg(a, "button"); return n; };
+DSL.input = function (placeholder, a) {
+  const n = new Node("input", "input", here());
+  if (typeof placeholder !== "string") fail(`input(placeholder, act((text, c) => …)) takes a placeholder first.`, here(), `Example: input("Add an item", act((text, c) => c.write("Todo", xs => xs.concat([{ text, done: false }]))))`, "T-MISSING");
+  n.props.placeholder = placeholder; n.props.act = actArg(a, "input"); return n;
+};
+
+class Space {
+  constructor(title, pos) { this.title = title; this.line = pos.line; this.root = new Node("space", "layout", pos); this.root.attached = true; }
+  add(...nodes) { this.root.kids.push(...kidsOf(nodes, this.root)); return this; }
+  link(a, b, label) { const l = DSL.link(a, b, label); l.attached = true; S().links.push(l); return this; }
+  use(fn) {
+    if (typeof fn !== "function") fail(`use() takes a build-time function: .use(s => s.add(…)).`, here(), ``, "T-USE");
+    fn(this); return this;
+  }
+}
+DSL.app = DSL.space = function (title) {
+  const s = S(), pos = here();
+  if (s.space) fail(`One app() per program: app("${s.space.title}") started on line ${s.space.line}.`, pos, `Chain everything onto one app, or group with zone().`, "T-SPACE-TWICE");
+  if (typeof title !== "string") fail(`app(title) takes a name, like app("Groceries").`, pos, ``, "T-SPACE");
+  s.space = new Space(title, pos); return s.space;
+};
+
+/* ---------- built-in apps as parts, and three small parts for answering ----------
+   quiz(file) poll(file) form(file) chart(file) board(file) timeline(file) cards(file)
+   slides(file) canvas(file) site(file) each show a data file through a view in TANKE
+   DESKTOP and write back to it when people use them. The @@quiz … blocks make
+   such a file and a one-line app; here they are parts you can place in any app. */
+const KIT_NAMES = ["quiz", "poll", "form", "chart", "board", "timeline", "cards", "slides", "canvas", "site", "records"];
+for (const k of KIT_NAMES) DSL[k] = function (ref, opts) {
+  const n = new Node(k, "kit", here());
+  if (ref === undefined) fail(`${k}() takes a file, like ${k}(file("Name · data")).`, here(), `The block @@${k} Name makes the file and the app for you.`, "T-FILE");
+  const f = fileArg(ref, k, null);
+  n.props.file = { name: f.name, type: f.type || "data", seed: f.seed !== undefined ? f.seed : null };
+  if (opts !== undefined) { if (!opts || typeof opts !== "object" || Array.isArray(opts)) fail(`${k}()'s second argument is an options object.`, here(), ``, "T-OPTION"); n.props.opts = Object.assign({}, opts); }
+  return n;
+};
+DSL.choices = function (question, options) {
+  const n = new Node("choices", "choices", here());
+  n.props.text = textArg(question, n, "question", true);
+  if (!Array.isArray(options) || !options.length || !options.every(o => typeof o === "string" || typeof o === "number")) fail(`choices(question, options) takes a list of options.`, here(), `Example: choices("Which city?", ["Lisbon", "Porto"]): a click hands the turn to Claude with the pick.`, "T-TYPE");
+  n.props.options = options.map(String); return n;
+};
+DSL.progress = function (label, v, max) {
+  const n = new Node("progress", "progress", here());
+  n.props.text = textArg(label, n, "label", true);
+  for (const [slot, x] of [["value", v], ["max", max === undefined ? 100 : max]]) { if (typeof x === "function") fail(`progress() got a bare function.`, here(), `Wrap it: progress("Done", live(c => …), 10).`, "T-BARE-FN"); if (!(x instanceof Live) && typeof x !== "number") fail(`progress(label, value, max) takes numbers or live(…).`, here(), ``, "T-TYPE"); n.props[slot] = x; }
+  return n;
+};
+DSL.md = function (text) { const n = new Node("md", "md", here()); n.props.text = textArg(text, n, "text", true); return n; };
+DSL.tabs = function (spec) {
+  const n = new Node("tabs", "layout", here());
+  if (!spec || typeof spec !== "object" || Array.isArray(spec) || spec instanceof Node) fail(`tabs({ Title: part, … }) takes an object of named parts.`, here(), `Example: tabs({ Overview: stack(…), Data: sheet(table) })`, "T-TYPE");
+  n.props.titles = Object.keys(spec); n.kids = kidsOf(Object.values(spec).map(v => Array.isArray(v) ? DSL.stack(...v) : v), n); return n;
+};
+DSL.divider = function () { return new Node("divider", "divider", here()); };
+/* facepile(): who is here now, as faces · avatar(id): one person's face and name (an id from c.me, c.people or c.everyone) */
+DSL.facepile = function (opts) {
+  const n = new Node("facepile", "facepile", here());
+  if (opts !== undefined) { if (!opts || typeof opts !== "object" || Array.isArray(opts)) fail(`facepile() takes { names } or nothing.`, here(), `Example: facepile({ names: true })`, "T-OPTION"); for (const k of Object.keys(opts)) { if (k !== "names") fail(`facepile() has no option "${k}".`, here(), `Options: names.`, "T-OPTION"); n.props.names = !!opts[k]; } }
+  return n;
+};
+DSL.avatar = function (who) {
+  const n = new Node("avatar", "avatar", here());
+  if (typeof who === "function") fail(`avatar() got a bare function.`, here(), `Wrap it: avatar(live(c => c.me.id)).`, "T-BARE-FN");
+  if (!(who instanceof Live) && typeof who !== "string") fail(`avatar(id) takes a person's id or live(c => id).`, here(), `Example: avatar(live(c => c.me.id))`, "T-TYPE");
+  n.props.who = who; return n;
+};
+DSL.badge = function (text) { const n = new Node("badge", "badge", here()); n.props.text = textArg(text, n, "text", true); return n; };
+/* ---------- the component kit: parts that make an app look and work like an app ----------
+   toolbar(…) a row of controls along the top · statusbar(…) a quiet line along the bottom
+   split(side, main) a sidebar and a main area (side.w(240) sets its width)
+   panel(title, …) a card with a title · list(items, { title, subtitle, meta, icon, pick, selected })
+   empty(text) an empty state · icon(name) one of the computer's icons · spacer() pushes what follows to the end
+   document(file) a word processor · spreadsheet(file) a spreadsheet (same as textedit and sheet) */
+DSL.toolbar = containerMaker("toolbar");
+DSL.statusbar = containerMaker("statusbar");
+DSL.split = function (side, main) {
+  const n = new Node("split", "layout", here());
+  if (!(side instanceof Node) || !(main instanceof Node)) fail(`split(side, main) takes two parts: a sidebar and the main area.`, here(), `Example: split(list(…), stack(…))`, "T-ARITY");
+  n.kids = kidsOf([side, main], n); return n;
+};
+DSL.panel = function (title, ...kids) { const n = new Node("panel", "layout", here()); n.props.title = textArg(title, n, "title", true); n.kids = kidsOf(kids, n); return n; };
+DSL.empty = function (text) { const n = new Node("empty", "empty", here()); n.props.text = textArg(text, n, "text", true); return n; };
+DSL.spacer = function () { return new Node("spacer", "spacer", here()); };
+const ICON_NAMES = () => Object.keys((T.ICONS) || {});
+DSL.icon = function (name) {
+  const n = new Node("icon", "icon", here());
+  if (typeof name !== "string") fail(`icon(name) takes an icon's name, like icon("star").`, here(), ``, "T-TYPE");
+  const names = ICON_NAMES(); if (names.length && !names.includes(name)) fail(`No icon called "${name}".`, here(), `Icons: ${names.join(", ")}.${closest(name, names) ? ` Did you mean "${closest(name, names)}"?` : ""}`, "T-ICON");
+  n.props.name = name; return n;
+};
+const LIST_OPTS = ["title", "subtitle", "meta", "icon", "pick", "selected"];
+DSL.list = function (items, opts) {
+  const n = new Node("list", "list", here());
+  if (typeof items === "function") fail(`list() got a bare function.`, here(), `Wrap it: list(live(c => c.records("Contacts")), …) so it updates.`, "T-BARE-FN");
+  if (!(items instanceof Live) && typeof items !== "string" && !Array.isArray(items)) fail(`list(items, opts) takes live(c => [...]), a records store's name, or an array.`, here(), `Example: list("Contacts", { title: "Name", subtitle: "Company" })`, "T-TYPE");
+  n.props.items = items;
+  const o = opts === undefined ? {} : opts;
+  if (!o || typeof o !== "object" || Array.isArray(o)) fail(`list()'s second argument is { title, subtitle, meta, icon, pick, selected }.`, here(), ``, "T-OPTION");
+  for (const [k, v] of Object.entries(o)) {
+    if (!LIST_OPTS.includes(k)) fail(`list() has no option "${k}".`, here(), `Options: ${LIST_OPTS.join(", ")}.${closest(k, LIST_OPTS) ? ` Did you mean "${closest(k, LIST_OPTS)}"?` : ""}`, "T-OPTION");
+    if (typeof v === "function") fail(`list({ ${k} }) got a bare function.`, here(), k === "pick" ? `Say when it runs: pick: act((item, c) => c.set("open", item.id))` : `For a computed ${k}: ${k}: live((item, c) => …); for a field, its name: ${k}: "Name".`, "T-BARE-FN");
+    if (k === "pick" && !(v instanceof Act)) fail(`list({ pick }) takes act((item, c) => …).`, here(), ``, "T-ACT");
+    if (k === "selected" && !(v instanceof Live) && typeof v !== "string" && typeof v !== "number") fail(`list({ selected }) takes live(c => id) or an id.`, here(), ``, "T-TYPE");
+    if (["title", "subtitle", "meta", "icon"].includes(k) && typeof v !== "string" && !(v instanceof Live)) fail(`list({ ${k} }) takes a field name or live((item, c) => …).`, here(), ``, "T-TYPE");
+  }
+  Object.assign(n.props, o); return n;
+};
+DSL.document = DSL.textedit; DSL.spreadsheet = DSL.sheet;
+/* reusable components: a library is an app whose program returns what it shares instead of calling app() */
+DSL.include = function (name) {
+  const s = S(), pos = here(), st = T.Store;
+  if (typeof name !== "string" || !name.trim()) fail(`include(name) takes the name of a library app.`, pos, `Example: const { Card } = include("UI kit")`, "T-FILE");
+  const f = st && (st.byName(name.trim(), "app") || st.byName(name.trim()));
+  if (!f) fail(`No library called “${name}” on this desktop.`, pos, `A library is an app whose program ends with return { Part, … } and has no app().`, "T-FILE");
+  if (T.Trust && !T.Trust.trusted(f)) fail(`The library “${name}” was written by someone else and has not been trusted on this computer yet.`, pos, `Open the library and press Run it, then this app builds.`, "T-TRUST");
+  s.including = s.including || []; if (s.including.includes(f.id)) fail(`include("${name}") includes itself.`, pos, ``, "T-FILE");
+  s.including.push(f.id);
+  try { const v = new Function(...DSL_NAMES, '"use strict";{' + String(f.content || "") + "\n}")(...DSL_NAMES.map(n => DSL[n])); if (!v || typeof v !== "object") fail(`“${name}” is not a library: its program must end with return { … }.`, pos, ``, "T-FILE"); return v; }
+  finally { s.including.pop(); }
+};
+
+const DSL_NAMES = Object.keys(DSL);
+
+/* ---------- finalize: keys, links, pins, drop targets ---------- */
+function finalize(s) {
+  const errors = [], warnings = s.warnings;
+  const E = (msg, pos, hint, code) => errors.push(new TankeError(msg, pos, hint, code));
+  if (!s.space) { E(`No app() in this program.`, { line: 1 }, `Start with app("Name").add(note("Hello"))`, "T-NO-SPACE"); return { errors, warnings }; }
+  const keys = {};
+  for (const n of s.nodes) if (n.props.key) { if (keys[n.props.key]) E(`Key "${n.props.key}" is used twice (lines ${s.byId[keys[n.props.key]].line} and ${n.line}).`, n, `Keys name one node each.`, "T-KEY-DUP"); else keys[n.props.key] = n.id; }
+  for (const l of s.links) for (const end of ["from", "to"]) {
+    const v = l.props[end];
+    if (typeof v === "string" && v[0] === "#") {
+      const k = v.slice(1);
+      if (!keys[k]) { const sug = closest(k, Object.keys(keys)); E(`link(): no node has the key "${k}".`, l, sug ? `Did you mean "#${sug}"?` : Object.keys(keys).length ? `Keys: ${Object.keys(keys).map(x => "#" + x).join(", ")}.` : `Give a node a key first: question("Why?").key("${k}")`, "T-LINK"); continue; }
+      l.props[end + "Id"] = keys[k];
+    } else { const n = s.byId[v]; if (!n.attached) E(`link() connects a ${n.type} (line ${n.line}) that is never placed.`, l, `Add it to a layout or to space().add(…).`, "T-LINK"); l.props[end + "Id"] = v; }
+  }
+  // top-level pin keys: stable across edits so dragged positions survive
+  const seen = {};
+  for (const id of s.space.root.kids) {
+    const n = s.byId[id];
+    let k = n.props.key || n.type + ":" + slug(typeof n.props.title === "string" ? n.props.title : typeof n.props.text === "string" ? n.props.text : "");
+    if (seen[k]) k += "-" + ++seen[k]; else seen[k] = 1;
+    n.pin = k;
+  }
+  // drop targets: a stream that assigns a kind or a tag (or unsorted) accepts drops; a zone around it is the target
+  for (const n of s.nodes) {
+    if (n.type !== "stream") continue;
+    const f = n.props.filter, kinds = Array.isArray(f.kind) ? f.kind : f.kind ? [f.kind] : [];
+    const assign = f.unsorted ? { unsorted: true } : kinds.length === 1 || f.tag ? { kind: kinds.length === 1 ? kinds[0] : undefined, tag: f.tag } : null;
+    n.props.assign = assign;
+    let p = n.parent ? s.byId[n.parent] : null;
+    while (p && p.type !== "zone" && p.type !== "space") p = p.parent ? s.byId[p.parent] : null;
+    if (p && p.type === "zone" && assign) { if (p.props.accepts) warnings.push({ line: p.line, message: `zone "${p.props.title}" holds two assignable streams; drops go to the first.`, code: "T-ZONE-TWO", severity: "warning" }); else p.props.accepts = n.id; }
+  }
+  for (const n of s.nodes) if (!n.attached && n.cls !== "link") warnings.push({ line: n.line, message: `${n.type} on line ${n.line} was made but never placed.`, code: "T-LOOSE", severity: "warning" });
+  return { errors, warnings };
+}
+
+/* ---------- IR emission ---------- */
+function propJSON(v) {
+  if (v instanceof Live) return { live: v.src.length > 200 ? v.src.slice(0, 197) + "…" : v.src, when: "runtime" };
+  if (Array.isArray(v)) return v.map(propJSON);
+  return v;
+}
+function emitIR(s, fin) {
+  const nodes = [], edges = [], lambdas = [];
+  for (const n of s.nodes) {
+    const props = {};
+    for (const [k, v] of Object.entries(n.props)) {
+      if (v instanceof Act) { props[k] = { act: v.src.length > 200 ? v.src.slice(0, 197) + "…" : v.src, when: "event" }; lambdas.push({ node: n.id, slot: k, when: "event", line: v.line, src: props[k].act }); continue; }
+      props[k] = propJSON(v); if (v instanceof Live) lambdas.push({ node: n.id, slot: k, when: "runtime", line: v.line, src: props[k].live });
+    }
+    nodes.push({ id: n.id, type: n.type, cls: n.cls, line: n.line, pin: n.pin, props: Object.keys(props).length ? props : undefined, kids: n.kids.length ? n.kids : undefined, parent: n.parent || undefined, gen: n.gen || undefined });
+    for (const k of n.kids) edges.push({ from: n.id, to: k, kind: "contains" });
+    if (n.type === "stream") edges.push({ from: "notes", to: n.id, kind: "reads", filter: n.props.filter });
+    if (n.cls === "editor" && n.props.file) { edges.push({ from: "file:" + n.props.file.name, to: n.id, kind: "reads" }); if (n.type !== "inspect") edges.push({ from: n.id, to: "file:" + n.props.file.name, kind: "writes" }); }
+    if (n.type === "files") edges.push({ from: "files", to: n.id, kind: "reads", filter: n.props.filter });
+    if (n.cls === "kit" && n.props.file) { edges.push({ from: "file:" + n.props.file.name, to: n.id, kind: "reads" }); edges.push({ from: n.id, to: "file:" + n.props.file.name, kind: "writes" }); }
+    if (n.cls === "link" && n.props.fromId && n.props.toId) edges.push({ from: n.props.fromId, to: n.props.toId, kind: "link", label: typeof n.props.label === "string" ? n.props.label : undefined, via: n.id });
+  }
+  const repeated = [...new Set(s.nodes.filter(n => n.gen).map(n => n.gen.line))].map(line => ({ when: "build", by: "repeat", line }));
+  const body = { title: s.space && s.space.title, nodes: nodes.map(n => Object.assign({}, n, { line: undefined })) };
+  return {
+    tanke: "0.1", title: s.space ? s.space.title : null, hash: fnv1a(stable(body)), root: s.space ? s.space.root.id : null,
+    sources: [{ id: "notes", type: "notes", note: "notes on this desktop, read at runtime by stream()" }, { id: "files", type: "files", note: "every file on this desktop, read at runtime by files()" }].concat(Object.values(s.files).map(f => ({ id: "file:" + f.name, type: "file", fileType: f.type, line: f.line }))),
+    files: Object.values(s.files).map(f => ({ name: f.name, type: f.type, seed: f.seed, line: f.line })),
+    params: s.params ? s.params.list.map(p => Object.assign({}, p)) : [], nodes, edges,
+    lambdas: lambdas.concat(repeated),
+    errors: fin.errors.map(e => e.toJSON()), warnings: fin.warnings,
+  };
+}
+
+/* ---------- compile: code → { ir, session, errors } ---------- */
+(function calibrate() { try { new Function(...DSL_NAMES, "throw new Error('k')")(); } catch (e) { const m = (e.stack || "").match(POS_RE); LINE_BASE = m ? +m[1] - 1 : 0; } })();
+function toTankeError(e, syntax) {
+  if (e instanceof TankeError) return e;
+  const pos = syntax ? { line: null, col: null } : posOfError(e);
+  let hint = "";
+  const m = /^(\w+) is not defined/.exec((e && e.message) || "");
+  if (m) { const sg = closest(m[1], DSL_NAMES); hint = sg ? `Did you mean ${sg}? Names are case-sensitive.` : `Not a Tanke function or a variable. See the reference at the end of the Book.`; }
+  else if (/is not a function/.test((e && e.message) || "")) {
+    const mm = /([\w.$]+) is not a function/.exec(e.message), name = mm ? mm[1].split(".").pop() : "";
+    const methods = ["add", "use", "link", "at", "key", "tone", "tag", "w", "h", "gap", "dim", "cols", "layout", "style", "turn"];
+    const sg = name && closest(name, methods.concat(DSL_NAMES));
+    hint = sg ? `Did you mean ${sg}()? Space methods: add, use, link. Modifiers: ${methods.slice(3).join(", ")}.` : `Check the name and that you chain onto a node or the space.`;
+  } else if (syntax) hint = `JavaScript syntax: look for a missing ")" or ",", or an unclosed string or bracket.`;
+  return new TankeError((syntax ? "Syntax error: " : "") + ((e && e.message) || String(e)), pos, hint, syntax ? "T-SYNTAX" : "T-JS");
+}
+function compile(code, paramValues) {
+  const s = (CUR = newSession(paramValues));
+  const prev = Error.stackTraceLimit; Error.stackTraceLimit = 40;
+  let thrown = null, syntax = false, ret;
+  try {
+    // the program runs in a block of its own, so a name it declares (const board = …) may shadow a Tanke function
+    const f = new Function(...DSL_NAMES, '"use strict";{' + code + "\n}");
+    try { ret = f(...DSL_NAMES.map(n => DSL[n])); } catch (e) { thrown = e; }
+  } catch (e) { thrown = e; syntax = true; }
+  finally { Error.stackTraceLimit = prev; }
+  let fin = { errors: [], warnings: s.warnings };
+  const library = !thrown && !s.space && ret && typeof ret === "object" ? Object.keys(ret) : null;
+  if (thrown) fin.errors = [toTankeError(thrown, syntax)];
+  else if (!library) fin = finalize(s);
+  const ir = emitIR(s, fin); if (library) ir.library = library;
+  CUR = null;
+  return { ir, session: s, errors: fin.errors, warnings: fin.warnings, syntax, library };
+}
+/* Syntax errors from new Function carry no line in some engines: re-parse in a throwaway script to read it. */
+function syntaxPosition(code) {
+  return new Promise(resolve => {
+    let done = false;
+    const onErr = ev => { if (done) return; done = true; window.removeEventListener("error", onErr, true); ev.preventDefault(); resolve({ line: ev.lineno ? ev.lineno - 1 : null, col: ev.colno || null }); };
+    window.addEventListener("error", onErr, true);
+    const sc = document.createElement("script"); sc.textContent = "(function(){\n" + code + "\n})"; document.head.appendChild(sc); sc.remove();
+    setTimeout(() => { if (!done) { done = true; window.removeEventListener("error", onErr, true); resolve(null); } }, 0);
+  });
+}
+
+/* ---------- thoughts: parsing captures ---------- */
+const PREFIX = [[/^\?\s+/, "question"], [/^!\s+/, "idea"], [/^=\s+/, "decision"], [/^\[\s?x?\s?\]\s*/i, "task"], [/^>\s+/, "quote"], [/^@\s+/, "source"]];
+function parseCapture(raw) {
+  let text = String(raw || "").trim(), kind = "note", done = false;
+  for (const [re, k] of PREFIX) if (re.test(text)) { if (k === "task" && /^\[\s?x\s?\]/i.test(text)) done = true; text = text.replace(re, ""); kind = k; break; }
+  const tags = [...new Set([...text.matchAll(/(^|\s)#([\w-]+)/g)].map(m => m[2].toLowerCase()))];
+  text = text.replace(/(^|\s)#([\w-]+)/g, "$1").replace(/\s{2,}/g, " ").trim();
+  const um = text.match(/https?:\/\/\S+/), url = um ? um[0] : undefined;
+  if (url && text.replace(url, "").trim()) text = text.replace(url, "").replace(/\s{2,}/g, " ").trim();
+  if (kind === "note" && /\?\s*$/.test(text)) kind = "question";
+  const out = { text, kind, tags, done }; if (url) out.url = url;
+  return out;
+}
+function matches(t, f) {
+  if (f.kind) { const ks = Array.isArray(f.kind) ? f.kind : [f.kind]; if (!ks.includes(t.kind)) return false; }
+  if (f.tag && !(t.tags || []).includes(f.tag)) return false;
+  if (f.by && f.by !== "any" && t.by !== f.by) return false;
+  if (f.who) { const me = T.Store && T.Store.me ? T.Store.me.id : null, w = t.who || (t.by === "you" ? me : null); if (f.who === "me" ? w !== me : f.who === "others" ? !w || w === me : w !== f.who) return false; }
+  if (f.text && !String(t.text).toLowerCase().includes(f.text.toLowerCase())) return false;
+  if (f.done !== undefined && !!t.done !== f.done) return false;
+  return true;
+}
+
+/* ==========================================================================
+   THE STREAM FORMAT · how Claude writes onto the desktop, token by token.
+   A line that starts with @@ opens a block; @@end closes it (so do the next
+   header and the end of the text). Everything outside blocks is what Claude
+   says. The parser is pure and runs on the WHOLE text so far on every token,
+   so a block can be drawn on the canvas while it is still being written and
+   committed to the store the moment it closes.
+     @@note question #pricing @ 120,40     one note; text inline or below
+     @@doc Brief #client                   body: text (markdown is fine)
+     @@list Groceries                      body: "- [ ] item" / "- [x] item"
+     @@table Budget                        body: a pipe table or CSV, header first
+     @@data Settings                       body: JSON
+     @@link Anthropic                      body: the address, then a title
+     @@page Landing                        body: a small HTML page
+     @@app Groceries                       body: a Tanke program
+     @@program Simulate                    body: JavaScript that runs (see PROGRAMS)
+     @@run Simulate                        runs a program; body: its input as JSON
+     @@file Brief · doc                    the same as @@doc Brief
+     @@append Brief                        adds text, items or rows
+     @@delete Brief
+     @@open Brief                          puts it on the desktop if tucked, brings it into view
+     @@focus Brief                         brings it into view (same as open)
+     @@tuck Brief                          takes it off the desktop; it stays in Files
+     @@move Brief @ 400,40                 moves it
+     @@end
+   ========================================================================== */
+const STREAM_OPS = ["note", "doc", "list", "table", "data", "link", "page", "program", "app", "file", "append", "delete", "run", "open", "focus", "tuck", "move", "sheet"].concat(KIT_NAMES);
+const ACTION_OPS = ["delete", "run", "open", "focus", "tuck", "move"]; // blocks that change a file without writing content
+const HEAD_RE = /^@@([a-z]+)\b[ \t]*(.*)$/;
+function parseHead(op, rest) {
+  let at = null, size = null; const tags = [];
+  rest = String(rest || "").replace(/(?:^|\s)@\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)(?:\s+(\d{2,4})\s*[x×]\s*(\d{2,4}))?\s*$/, (_, x, y, w, h) => { at = [Math.round(+x), Math.round(+y)]; if (w) size = [Math.max(160, +w), Math.max(100, +h)]; return ""; });
+  rest = rest.replace(/\s*\((?:id|by)\s[^)]*\)\s*$/, ""); // the desktop is shown to Claude with (id … · by …) after headers
+  rest = rest.replace(/(^|\s)#([\w-]+)/g, (_, a, t) => { tags.push(t.toLowerCase()); return a; }).replace(/\s{2,}/g, " ").trim();
+  const unq = v => String(v || "").trim().replace(/^["“'`]|["”'`]$/g, "").trim();
+  const b = { op: "write", type: op, name: unq(rest), kind: null, inline: "", tags: [...new Set(tags)], at, size, target: null };
+  if (op === "file") { const parts = rest.split(/\s+[·|]\s+|\s+::\s+/); b.name = unq(parts[0]); const ty = String(parts[1] || "doc").trim().toLowerCase(); b.type = FILE_TYPES.includes(ty) ? ty : "doc"; }
+  if (op === "note") { const w = rest.split(/\s+/)[0].toLowerCase(); b.kind = KINDS.includes(w) ? w : "note"; b.inline = KINDS.includes(w) ? rest.slice(w.length).trim() : rest; b.name = ""; }
+  if (op === "sheet") { b.type = "table"; } // a spreadsheet is a table with formulas
+  if (KIT_NAMES.includes(op)) { const parts = rest.split(/\s+[·|]\s+/); b.op = "kit"; b.kit = op; b.type = "app"; b.name = unq(parts[0]); b.variant = String(parts[1] || "").trim().toLowerCase(); }
+  if (op === "append" || ACTION_OPS.includes(op)) { b.op = op === "focus" ? "open" : op; b.type = null; b.target = unq(rest); b.name = b.target; }
+  return b;
+}
+function parseStream(text, final) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n"), blocks = [], prose = [];
+  let cur = null;
+  const finish = b => {
+    let body = b.lines.slice();
+    while (body.length && !body[0].trim()) body.shift();
+    while (body.length && !body[body.length - 1].trim()) body.pop();
+    if (body.length && /^\s*```/.test(body[0])) { body.shift(); if (body.length && /^\s*```\s*$/.test(body[body.length - 1])) body.pop(); }
+    b.body = (b.inline ? [b.inline] : []).concat(body).join("\n"); delete b.lines;
+    blocks.push(b);
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i], m = HEAD_RE.exec(l);
+    if (m && (STREAM_OPS.includes(m[1]) || m[1] === "end")) {
+      if (cur) { cur.closed = true; finish(cur); cur = null; }
+      if (m[1] === "end") continue;
+      cur = Object.assign(parseHead(m[1], m[2]), { i: blocks.length, line: i + 1, lines: [], closed: false });
+      continue;
+    }
+    if (cur) cur.lines.push(l); else prose.push(l);
+  }
+  // while streaming, a last line that starts with @ may be a header still being typed: keep it out of the body
+  if (cur && !final && cur.lines.length && /^@/.test(cur.lines[cur.lines.length - 1])) cur.lines.pop();
+  if (cur) { cur.closed = !!final; finish(cur); }
+  return { prose: prose.join("\n").replace(/\n{3,}/g, "\n\n").trim(), blocks };
+}
+function splitCSV(line) {
+  const out = []; let cell = "", q = false;
+  for (let i = 0; i < line.length; i++) { const ch = line[i]; if (q) { if (ch === '"' && line[i + 1] === '"') { cell += '"'; i++; } else if (ch === '"') q = false; else cell += ch; } else if (ch === '"') q = true; else if (ch === ",") { out.push(cell.trim()); cell = ""; } else cell += ch; }
+  out.push(cell.trim()); return out;
+}
+const numish = v => (/^-?\d+(\.\d+)?$/.test(String(v).trim()) ? Number(v) : v);
+function tableRows(s) {
+  return String(s).split("\n").map(l => l.trim()).filter(l => l && !(/^[\s|:\-]+$/.test(l) && l.includes("-")))
+    .map(l => (l.includes("|") ? l.replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim()) : splitCSV(l)).map(numish));
+}
+/* body text → file content, by type. Partial text decodes too (for drafts). */
+function decodeBody(type, body, rowsOnly) {
+  const s = String(body ?? "");
+  if (type === "list") return s.split("\n").map(l => l.trim()).filter(Boolean).map(l => { const m = /^(?:[-*+•]|\d+[.)])?\s*(?:\[( |x|X)?\]\s*)?(.*)$/.exec(l); return { text: m[2].trim(), done: /x/i.test(m[1] || "") }; }).filter(x => x.text);
+  if (type === "table") { const rows = tableRows(s); if (rowsOnly) return rows; return { cols: (rows[0] || ["A"]).map(String), rows: rows.slice(1) }; }
+  if (type === "data") { try { return JSON.parse(s); } catch (e) { return s; } }
+  if (type === "link") { const u = (s.match(/https?:\/\/\S+/) || [""])[0]; const title = s.split("\n").map(x => x.replace(u, "").trim()).find(Boolean) || ""; return { url: u, title }; }
+  return s;
+}
+/* file content → body text: how the agent is shown files, so it reads what it writes */
+function encodeBody(type, v) {
+  if (type === "list") return (Array.isArray(v) ? v : []).map(x => typeof x === "object" && x ? `- [${x.done ? "x" : " "}] ${x.text ?? ""}` : `- [ ] ${x}`).join("\n");
+  if (type === "table") { const t = v && typeof v === "object" ? v : { cols: [], rows: [] }; const row = r => "| " + [].concat(r).map(c => String(c ?? "").replace(/\|/g, "/")).join(" | ") + " |"; return [row(t.cols || []), "| " + (t.cols || []).map(() => "---").join(" | ") + " |"].concat((t.rows || []).map(row)).join("\n"); }
+  if (type === "link") return v && typeof v === "object" ? [v.url || "", v.title || ""].filter(Boolean).join("\n") : String(v || "");
+  if (type === "data") { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+  return v == null ? "" : String(v);
+}
+
+/* ==========================================================================
+   BUILT-IN APPS · content in, a working app out.
+   Each kit reads a short plain-text body (the way Claude writes it, and the
+   way it streams) into data, and writes data back to that text, so Claude
+   sees a kit in the view in the same shape it wrote it. The page stores the
+   data in a data file "<Name> · data" and makes an app "<Name>" whose whole
+   program is one line, like quiz(file("<Name> · data")). The views are in
+   TANKE DESKTOP; here is only text ⇄ data, which is pure.
+     @@quiz Name            ? question / - option / * correct option / > why
+     @@poll Name · multi    the question, then - options
+     @@form Name            intro lines, then - Label: text|long|number|date|email|yes|choice (a, b)
+     @@chart Name · line    a pipe table: first column the labels, the rest numbers (bar by default)
+     @@board Name           ## Column, then - cards
+     @@timeline Name        - when: what   (- [x] when: what is done)
+     @@cards Name · pick    ## Title, then Key: value facts and body lines
+     @@slides Name          markdown slides separated by a line ---
+     @@canvas Name · tb     [Box] (Round) ((Circle)) <Decision?> note: text, #yellow, @ x,y, A -> B: label, A --> B
+     @@site Name            markdown made into a website: # hero, ## sections, [Button](url)
+   ========================================================================== */
+const kitLines = s => String(s || "").replace(/\r/g, "").split("\n");
+const bullet = /^\s*(?:[-*+•]|\d+[.)])\s+/;
+const KITS = {
+  quiz: {
+    title: "Quiz", size: [560, 560],
+    parse(body) {
+      const questions = []; let cur = null;
+      for (const raw of kitLines(body)) {
+        const t = raw.trim(); if (!t) continue;
+        let m;
+        if ((m = /^(?:\?|q:|\d+[.)]\s*(?=.*\?))\s*(.*)$/i.exec(t)) && !/^[-*+]\s/.test(t)) { cur = { q: m[1].trim(), options: [], answer: -1, why: "" }; questions.push(cur); continue; }
+        if (!cur) { cur = { q: t, options: [], answer: -1, why: "" }; questions.push(cur); continue; }
+        if ((m = /^(?:>|why:|because:?)\s*(.*)$/i.exec(t))) { cur.why = (cur.why ? cur.why + " " : "") + m[1].trim(); continue; }
+        if ((m = /^([-*+])\s+(?:\[( |x|X)\]\s*)?(.*)$/.exec(t))) {
+          let text = m[3].trim(); const right = m[1] === "*" || /x/i.test(m[2] || "") || /\s*(?:✓|\(correct\))$/.test(text);
+          text = text.replace(/\s*(?:✓|\(correct\))$/, "");
+          if (right) cur.answer = cur.options.length; cur.options.push(text); continue;
+        }
+        if (!cur.options.length) cur.q += " " + t; else cur.why = (cur.why ? cur.why + " " : "") + t;
+      }
+      return { questions, answers: {} };
+    },
+    encode: d => (d.questions || []).map(q => [`? ${q.q}`].concat((q.options || []).map((o, i) => `${i === q.answer ? "*" : "-"} ${o}`), q.why ? [`> ${q.why}`] : []).join("\n")).join("\n\n"),
+    merge: (a, b) => Object.assign({}, a, { questions: (a.questions || []).concat(b.questions || []) }),
+    // ppl: what each person did ([{ name, v }]); a quiz mark is { question: option }
+    state(d, ppl) {
+      const qs = d.questions || [];
+      if (ppl && ppl.length) return ppl.map(p => { const m = p.v && typeof p.v === "object" ? p.v : {}, done = qs.filter(q => m[q.q] !== undefined).length, right = qs.filter(q => m[q.q] !== undefined && m[q.q] === (q.options || [])[q.answer]).length; return `${p.name}: ${done} of ${qs.length} answered, ${right} right`; }).join("; ");
+      const ans = d.answers || {}, done = Object.keys(ans).length, right = qs.filter((q, i) => ans[i] !== undefined && ans[i] === q.answer).length; return done ? `${done} of ${qs.length} answered, ${right} right` : `${qs.length} questions, none answered yet`;
+    },
+  },
+  poll: {
+    title: "Poll", size: [460, 420],
+    parse(body, variant) {
+      const options = [], q = [];
+      for (const raw of kitLines(body)) { const t = raw.trim(); if (!t) continue; if (bullet.test(t)) options.push(t.replace(bullet, "").replace(/^\[( |x|X)\]\s*/, "").trim()); else if (!options.length) q.push(t); else options.push(t); }
+      return { question: q.join(" "), options, multi: /multi|many/.test(variant || ""), picked: [] };
+    },
+    encode: d => [d.question || ""].concat((d.options || []).map(o => `- ${o}`)).join("\n"),
+    merge: (a, b) => Object.assign({}, a, { options: (a.options || []).concat((b.options || []).filter(o => !(a.options || []).includes(o))) }),
+    state: (d, ppl) => {
+      const b = (ppl || []).filter(p => Array.isArray(p.v) && p.v.length);
+      if (b.length) return `${b.length} voted: ` + (d.options || []).map(o => { const w = b.filter(p => p.v.includes(o)); return w.length ? `${o} ${w.length} (${w.map(p => p.name).join(", ")})` : null; }).filter(Boolean).join(", ");
+      return (d.picked || []).length ? `picked: ${(d.picked || []).map(i => (d.options || [])[i]).filter(Boolean).join(", ")}` : "nothing picked yet";
+    },
+  },
+  form: {
+    title: "Form", size: [480, 520],
+    parse(body) {
+      const fields = [], intro = [];
+      for (const raw of kitLines(body)) {
+        const t = raw.trim(); if (!t) continue;
+        const isField = bullet.test(t) || /^[^:]{1,60}:\s*(text|long|number|date|email|yes|choice)\b/i.test(t);
+        if (!isField) { if (!fields.length) intro.push(t); continue; }
+        const s2 = t.replace(bullet, ""), m = /^([^:]+?)(?::\s*([a-z]+)\s*(?:\(([^)]*)\))?)?\s*(?:=\s*(.*))?$/i.exec(s2);
+        if (!m) continue;
+        const label = m[1].trim(), type = ["text", "long", "number", "date", "email", "yes", "choice"].includes((m[2] || "").toLowerCase()) ? m[2].toLowerCase() : "text";
+        const key = label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 40) || "field" + fields.length;
+        const f = { key, label, type }; if (m[3]) f.options = m[3].split(",").map(x => x.trim()).filter(Boolean); if (f.options && type === "text") f.type = "choice"; if (m[4]) f.value = m[4].trim();
+        fields.push(f);
+      }
+      const values = {}; for (const f of fields) if (f.value !== undefined) values[f.key] = f.type === "number" ? Number(f.value) : f.type === "yes" ? /^(y|yes|true|1)$/i.test(f.value) : f.value;
+      return { intro: intro.join("\n"), fields, values };
+    },
+    encode: d => [d.intro || ""].filter(Boolean).concat((d.fields || []).map(f => `- ${f.label}: ${f.type}${f.options ? ` (${f.options.join(", ")})` : ""}`)).join("\n"),
+    merge: (a, b) => Object.assign({}, a, { fields: (a.fields || []).concat(b.fields || []) }),
+    state: (d, ppl) => {
+      const one = v => (d.fields || []).filter(f => v[f.key] !== undefined && v[f.key] !== "").map(f => `${f.label}: ${v[f.key]}`).join("; ");
+      const r = (ppl || []).filter(p => p.v && typeof p.v === "object" && one(p.v));
+      if (r.length) return `${r.length} response${r.length === 1 ? "" : "s"}: ` + r.map(p => `${p.name}: ${one(p.v)}`).join(" | ");
+      return one(d.values || {}) || "empty";
+    },
+  },
+  chart: {
+    title: "Chart", size: [580, 400],
+    parse(body, variant) { const t = decodeBody("table", body); return { kind: /line/.test(variant || "") ? "line" : "bar", cols: t.cols, rows: t.rows }; },
+    encode: d => encodeBody("table", { cols: d.cols || [], rows: d.rows || [] }),
+    merge: (a, b) => Object.assign({}, a, { rows: (a.rows || []).concat(b.rows || []) }),
+    state: d => `${(d.rows || []).length} rows, ${d.kind || "bar"} chart`,
+  },
+  board: {
+    title: "Board", size: [760, 460],
+    parse(body) {
+      const columns = [], items = []; let col = null;
+      for (const raw of kitLines(body)) {
+        const t = raw.trim(); if (!t) continue; let m;
+        if ((m = /^#{1,3}\s+(.*)$/.exec(t)) || (!bullet.test(t) && (m = /^(.{1,40}):$/.exec(t)))) { col = m[1].trim(); if (!columns.includes(col)) columns.push(col); continue; }
+        const text = t.replace(bullet, "").replace(/^\[( |x|X)\]\s*/, "").trim(); if (!text) continue;
+        if (!col) { col = "To do"; if (!columns.includes(col)) columns.push(col); }
+        items.push({ text, column: col });
+      }
+      if (!columns.length) columns.push("To do", "Doing", "Done");
+      return { columns, items };
+    },
+    encode: d => (d.columns || []).map(c => [`## ${c}`].concat((d.items || []).filter(i => i.column === c).map(i => `- ${i.text}`)).join("\n")).join("\n\n"),
+    merge: (a, b) => ({ columns: [...new Set((a.columns || []).concat(b.columns || []))], items: (a.items || []).concat(b.items || []) }),
+    state: d => (d.columns || []).map(c => `${c}: ${(d.items || []).filter(i => i.column === c).length}`).join(", "),
+  },
+  timeline: {
+    title: "Timeline", size: [520, 480],
+    parse(body) {
+      const items = [];
+      for (const raw of kitLines(body)) {
+        let t = raw.trim(); if (!t) continue;
+        const done = /^[-*+]\s+\[(x|X)\]/.test(t); t = t.replace(bullet, "").replace(/^\[( |x|X)\]\s*/, "");
+        // "Mon — arrive", "9:00: breakfast", "2026 | launch": the first separator followed by a space wins
+        const m = /^(.{1,40}?)\s+[—–-]\s+(.+)$/.exec(t) || /^(.{1,40}?):\s+(.+)$/.exec(t) || /^(.{1,40}?)\s*\|\s*(.+)$/.exec(t);
+        items.push(m ? { when: m[1].trim(), text: m[2].trim(), done } : { when: "", text: t, done });
+      }
+      return { items };
+    },
+    encode: d => (d.items || []).map(i => `- ${i.done ? "[x] " : ""}${i.when ? i.when + ": " : ""}${i.text}`).join("\n"),
+    merge: (a, b) => ({ items: (a.items || []).concat(b.items || []) }),
+    state: d => { const it = d.items || []; return `${it.length} steps, ${it.filter(i => i.done).length} done`; },
+  },
+  cards: {
+    title: "Cards", size: [760, 460],
+    parse(body, variant) {
+      const cards = []; let cur = null;
+      for (const raw of kitLines(body)) {
+        const t = raw.trim(); let m;
+        if ((m = /^#{1,3}\s+(.*)$/.exec(t))) { cur = { title: m[1].trim(), facts: [], body: "" }; cards.push(cur); continue; }
+        if (!t) continue;
+        if (!cur) { cur = { title: t, facts: [], body: "" }; cards.push(cur); continue; }
+        if ((m = /^(?:[-*+]\s+)?([^:]{1,28}):\s+(.+)$/.exec(t)) && !/^https?$/i.test(m[1])) { cur.facts.push([m[1].trim(), m[2].trim()]); continue; }
+        cur.body = (cur.body ? cur.body + "\n" : "") + t;
+      }
+      return { cards, pick: /pick|choose/.test(variant || ""), picked: null };
+    },
+    encode: d => (d.cards || []).map(c => [`## ${c.title}`].concat((c.facts || []).map(([k, v]) => `${k}: ${v}`), c.body ? [c.body] : []).join("\n")).join("\n\n"),
+    merge: (a, b) => Object.assign({}, a, { cards: (a.cards || []).concat(b.cards || []) }),
+    state: (d, ppl) => {
+      const c = (ppl || []).filter(p => typeof p.v === "string");
+      if (c.length) return c.map(p => `${p.name} chose ${p.v}`).join("; ");
+      return d.picked != null && (d.cards || [])[d.picked] ? `chose ${(d.cards || [])[d.picked].title}` : `${(d.cards || []).length} cards`;
+    },
+  },
+  slides: {
+    title: "Slides", size: [880, 580],
+    parse: body => ({ slides: String(body || "").replace(/\r/g, "").split(/\n\s*---+\s*\n/).map(x => x.trim()).filter(Boolean), at: 0 }),
+    encode: d => (d.slides || []).join("\n\n---\n\n"),
+    merge: (a, b) => Object.assign({}, a, { slides: (a.slides || []).concat(b.slides || []) }),
+    state: d => `${(d.slides || []).length} slides, showing ${Math.min((d.at || 0) + 1, (d.slides || []).length || 1)}`,
+  },
+  canvas: {
+    title: "Canvas", size: [760, 500],
+    parse(body, variant) {
+      const nodes = [], edges = [], byLabel = new Map(), COLORS = ["yellow", "pink", "blue", "green", "grey", "purple", "orange"];
+      const node = (label, shape, at, color) => { label = label.trim(); let n = byLabel.get(label.toLowerCase()); if (!n) { n = { id: "n" + nodes.length, label, shape: shape || "box" }; nodes.push(n); byLabel.set(label.toLowerCase(), n); } if (shape) n.shape = shape; if (at) { n.x = at[0]; n.y = at[1]; } if (color) n.color = color; return n; };
+      const ref = (t, color) => { t = t.trim(); let m;
+        if ((m = /^\[(.*)\]$/.exec(t))) return node(m[1], "box", null, color);
+        if ((m = /^\(\((.*)\)\)$/.exec(t))) return node(m[1], "circle", null, color);
+        if ((m = /^\((.*)\)$/.exec(t))) return node(m[1], "round", null, color);
+        if ((m = /^<(.*)>$/.exec(t))) return node(m[1], "diamond", null, color);
+        if ((m = /^note:\s*(.+)$/i.exec(t))) return node(m[1], "note", null, color || "yellow");
+        return node(t, null, null, color); };
+      for (const raw of kitLines(body)) {
+        let t = raw.trim().replace(bullet, ""); if (!t) continue; let at = null, color = null, m;
+        t = t.replace(/\s*@\s*(-?\d+)\s*,\s*(-?\d+)\s*$/, (_, x, y) => { at = [+x, +y]; return ""; });
+        t = t.replace(/\s+#([a-z]+)\s*$/i, (all, c) => COLORS.includes(c.toLowerCase()) ? (color = c.toLowerCase(), "") : all);
+        if ((m = /^(.+?)\s*(-->|->|—>|=>)\s*(.+?)(?::\s*(.+))?$/.exec(t)) && !/^note:/i.test(t)) { const a = ref(m[1]), b = ref(m[3], color); edges.push({ from: a.id, to: b.id, label: (m[4] || "").trim(), dashed: m[2] === "-->" }); continue; }
+        const n = ref(t, color); if (at) { n.x = at[0]; n.y = at[1]; }
+      }
+      // what has no place goes in layers by distance from the sources, left to right (or top to bottom)
+      const down = /tb|down|vertical/.test(variant || ""), depth = new Map(nodes.map(n => [n.id, 0]));
+      for (let k = 0; k < nodes.length; k++) for (const e of edges) if (e.from !== e.to && !e.dashed) depth.set(e.to, Math.max(depth.get(e.to), Math.min(depth.get(e.from) + 1, 12)));
+      const rows = {}; for (const n of nodes) if (n.x == null) { const d = depth.get(n.id), r = rows[d] = (rows[d] || 0) + 1; n.x = 24 + (down ? (r - 1) * 210 : d * 220); n.y = 24 + (down ? d * 130 : (r - 1) * 120); n.auto = true; }
+      return { nodes, edges, dir: down ? "TB" : "LR" };
+    },
+    encode: d => (d.nodes || []).map(n => { const L = n.label, sh = { note: "note: " + L, round: "(" + L + ")", circle: "((" + L + "))", diamond: "<" + L + ">" }[n.shape] || "[" + L + "]"; return `${sh}${n.color && n.shape !== "note" || n.color && n.color !== "yellow" ? " #" + n.color : ""} @ ${Math.round(n.x || 0)},${Math.round(n.y || 0)}`; })
+      .concat((d.edges || []).map(e => { const L = id => ((d.nodes || []).find(n => n.id === id) || {}).label || id; return `${L(e.from)} ${e.dashed ? "-->" : "->"} ${L(e.to)}${e.label ? ": " + e.label : ""}`; })).join("\n"),
+    merge: (a, b) => { const m = KITS.canvas.parse(KITS.canvas.encode(a) + "\n" + KITS.canvas.encode(b), a.dir === "TB" ? "tb" : ""); m.nodes.forEach(n => delete n.auto); return m; },
+    state: d => `${(d.nodes || []).length} shapes, ${(d.edges || []).length} arrows`,
+  },
+  records: {
+    title: "Records", size: [680, 440],
+    parse(body) { const t = decodeBody("table", body); const fields = t.cols.map(String); return { fields, records: t.rows.map((r, i) => Object.assign({ id: "r" + i.toString(36) + Math.random().toString(36).slice(2, 6) }, Object.fromEntries(fields.map((f, k) => [f, r[k] ?? ""])))) }; },
+    encode: d => encodeBody("table", { cols: d.fields || [], rows: (d.records || []).map(r => (d.fields || []).map(f => r[f] ?? "")) }),
+    merge: (a, b) => ({ fields: [...new Set((a.fields || []).concat(b.fields || []))], records: (a.records || []).concat(b.records || []) }),
+    state: d => `${(d.records || []).length} records`,
+  },
+  site: {
+    title: "Website", size: [720, 560],
+    parse: body => ({ md: String(body || "").replace(/\r/g, "").trim() }),
+    encode: d => d.md || "",
+    merge: (a, b) => ({ md: [a.md, b.md].filter(Boolean).join("\n\n") }),
+    state: d => `${(String(d.md || "").match(/^##?\s/gm) || []).length} sections`,
+  },
+};
+/* A rewrite keeps what people did: answers, picks, filled-in values, places on a canvas, record
+   ids. carry(old, next, variant) takes the state of the old data over to the new content, matched
+   by text, so Claude can change a quiz without wiping the answers already given. A variant left
+   out keeps the old one (a poll stays multi-pick unless Claude says otherwise). */
+const KIT_CARRY = {
+  quiz(a, b) { const was = new Map((a.questions || []).map((q, i) => [q.q, i])), ans = {}; (b.questions || []).forEach((q, i) => { const k = was.get(q.q), old = k != null ? (a.answers || {})[k] : undefined; if (old !== undefined && (a.questions[k].options || [])[old] === (q.options || [])[old]) ans[i] = old; }); return Object.assign({}, b, { answers: ans }); },
+  poll(a, b, v) { const picked = (a.picked || []).map(i => (a.options || [])[i]).map(o => (b.options || []).indexOf(o)).filter(i => i >= 0); return Object.assign({}, b, { multi: v ? b.multi : !!a.multi, picked: (v ? b.multi : a.multi) ? picked : picked.slice(0, 1) }); },
+  form(a, b) { const values = {}; for (const f of b.fields || []) { const v = (b.values || {})[f.key] !== undefined ? b.values[f.key] : (a.values || {})[f.key]; if (v !== undefined) values[f.key] = v; } return Object.assign({}, b, { values }); },
+  chart: (a, b, v) => Object.assign({}, b, { kind: v ? b.kind : a.kind || b.kind }),
+  timeline(a, b) { const done = new Set((a.items || []).filter(i => i.done).map(i => i.text)); return Object.assign({}, b, { items: (b.items || []).map(i => Object.assign({}, i, { done: i.done || done.has(i.text) })) }); },
+  cards(a, b, v) { const was = a.picked != null ? ((a.cards || [])[a.picked] || {}).title : null, k = (b.cards || []).findIndex(c => c.title === was); return Object.assign({}, b, { pick: v ? b.pick : !!a.pick, picked: k >= 0 ? k : null }); },
+  slides: (a, b) => Object.assign({}, b, { at: Math.max(0, Math.min((b.slides || []).length - 1, a.at || 0)) }),
+  canvas(a, b, v) { const was = new Map((a.nodes || []).map(n => [String(n.label).toLowerCase(), n])); return Object.assign({}, b, { dir: v ? b.dir : a.dir || b.dir, nodes: (b.nodes || []).map(n => { const o = was.get(String(n.label).toLowerCase()), m = Object.assign({}, n); if (o && n.auto) { m.x = o.x; m.y = o.y; } if (o && !n.color && o.color) m.color = o.color; delete m.auto; return m; }) }); },
+  records(a, b) {
+    const key = (b.fields || [])[0], pool = new Map(); for (const r of a.records || []) { const k = String(r[key] ?? ""); if (!pool.has(k)) pool.set(k, []); pool.get(k).push(r.id); }
+    return Object.assign({}, b, { records: (b.records || []).map((r, i) => { const ids = pool.get(String(r[key] ?? "")); const id = ids && ids.length ? ids.shift() : r.id; return Object.assign({}, r, { id }); }) });
+  },
+};
+/* the variant a kit is in, as it would be written after "·" in its block header */
+const KIT_VARIANT = { poll: d => d.multi ? "multi" : "", chart: d => d.kind === "line" ? "line" : "", cards: d => d.pick ? "pick" : "", canvas: d => d.dir === "TB" ? "tb" : "" };
+const kitVariant = (kit, d) => (KIT_VARIANT[kit] ? KIT_VARIANT[kit](d || {}) : "");
+function kitCarry(kit, old, next, variant) { try { return old && KIT_CARRY[kit] ? KIT_CARRY[kit](old, next, variant) : next; } catch (e) { return next; } }
+const KIT_SAMPLES = {
+  quiz: "? Which planet is closest to the sun?\n- Venus\n* Mercury\n- Mars\n> Mercury orbits at about 58 million km.\n\n? How many continents are there?\n- 5\n* 7\n- 9",
+  poll: "Where should we go for lunch?\n- Thai\n- Pizza\n- Salad bar",
+  form: "Tell me about the project.\n- Name\n- Budget: number\n- Deadline: date\n- Style: choice (calm, bold, playful)\n- Notes: long",
+  chart: "| Month | Visitors | Signups |\n| --- | --- | --- |\n| Jan | 120 | 14 |\n| Feb | 180 | 22 |\n| Mar | 260 | 31 |\n| Apr | 240 | 35 |",
+  board: "## To do\n- Write the brief\n- Book the venue\n## Doing\n- Draft the budget\n## Done\n- Pick a date",
+  timeline: "- [x] Mon: kick-off\n- Wed: first draft\n- Fri: review\n- Next Tue: launch",
+  cards: "## Option A\nPrice: 120\nTime: 2 weeks\nThe quick route.\n## Option B\nPrice: 90\nTime: 4 weeks\nCheaper, slower.",
+  slides: "# A title slide\nOne line about it\n---\n## The problem\n- First point\n- Second point\n---\n## The plan\n1. Start small\n2. Learn\n3. Grow",
+  canvas: "[Idea] -> <Worth it?>\n<Worth it?> -> [Prototype]: yes\n<Worth it?> -> (Park it): no\n[Prototype] -> [Learn]\nnote: Keep it small #pink",
+  records: "| Name | Company | Stage |\n| --- | --- | --- |\n| Ada | Analytical | Lead |\n| Grace | Navy | Customer |",
+  site: "# A small studio\nWe design calm software for busy people.\n\n[Get in touch](https://example.com)\n\n## What we do\n- Product design\n- Prototypes\n- Design systems\n\n## Work\nA few projects we are proud of.",
+};
+const kitCode = (kit, name) => `app(${JSON.stringify(name)}).add(${kit}(file(${JSON.stringify(name + " · data")}, { type: "data" })))\n`;
+
+Object.assign(T, { merge3, same, KITS, KIT_NAMES, KIT_SAMPLES, kitCode, kitCarry, kitVariant, compile, syntaxPosition, DSL, DSL_NAMES, Live, Act, TankeError, KINDS, TONES, AUTHORS, FILTER_KEYS, FILE_TYPES, SEEDS, fnv1a, stable, closest, describe, slug, parseCapture, matches, STREAM_OPS, ACTION_OPS, parseStream, decodeBody, encodeBody });
+
+/* ==========================================================================
+   TANKE STORE · the shared memory, one small computer per conversation.
+   One artifact holds many desktops. With the db capability, the page, its
+   canvas agent and Claude in the chat share these documents, live:
+     desks/{deskId}                  { title, at, by, inbox: [x, y] }
+     desks/{deskId}/files/{fileId}   { name, type, content, kind, tags, done, links, url,
+                                       placed, x, y, w, h, by, at, updated, fresh, … }
+     desks/{deskId}/events/{id}      { at, by, op, text, ref, kind, before? }
+     desks/{deskId}/cursors/claude   { at }: how far Claude in the chat has read (the shared channel)
+     claude/{deskId}                 THE SHARED VIEW: what an editor's Claude reads, one get
+     claude/{deskId}/turns/{turnId}  A TURN: { text } in the block format, one set
+   Many people, many Claudes. Everyone signed in has an id (the user
+   capability), and each person's Claude has a channel of its own, private
+   to that person:
+     data/users/{me}/claude-{deskId}              THE VIEW for my Claude
+     data/users/{me}/claude-{deskId}/turns/{id}   MY CLAUDE'S TURNS: { text, agent? }
+     data/users/{me}/claude-{deskId}-read         { at }: how far my Claude has read
+   and what each person does in a built-in app (a vote, an answer, a form)
+   is theirs, readable by everyone, written only by them:
+     people/{id}                     { at }: who has been on this computer
+     people/{id}/desks/{deskId}      { at, marks: { scope: { j: JSON, at } } }
+   Files, events and marks carry `who`: the id of the person (or the person
+   whose Claude) did it. Names are never stored, only ids.
+   Only this page writes files and events. Claude in the chat writes text to
+   a turn; the page plays it in, records what landed and refreshes the view.
+   Every record is normalised on arrival, so no hand-written document can
+   break the desktop. Without db (a saved copy of this file) the same API
+   keeps everything in this browser.
+   ========================================================================== */
+(function () {
+"use strict";
+const T = window.Tanke;
+const uid = p => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const clean = o => JSON.parse(JSON.stringify(o));
+const listeners = new Set();
+const LS = k => "tanke.v2." + k;
+const lget = (k, d) => { try { const v = localStorage.getItem(LS(k)); return v == null ? d : JSON.parse(v); } catch (e) { return d; } };
+const lset = (k, v) => { try { localStorage.setItem(LS(k), JSON.stringify(v)); } catch (e) {} };
+const TAB = uid("tab");
+
+/* ---------- records arrive from anywhere: make every one safe to draw ---------- */
+const S = x => typeof x === "string" ? x : x == null ? "" : typeof x === "object" ? JSON.stringify(x) : String(x);
+const A = x => Array.isArray(x) ? x : x == null || x === "" ? [] : [x];
+const MS = x => typeof x === "number" && isFinite(x) ? x : (Date.parse(x) || 0);
+const N = (x, d) => { const n = typeof x === "string" && x.trim() === "" ? NaN : Number(x); return x != null && isFinite(n) ? n : d; };
+const safeUrl = u => /^https?:\/\//i.test(S(u).trim()) ? S(u).trim() : undefined;
+const BY = ["you", "claude", "agent"];
+const WHO_ID = /^[A-Za-z0-9_-]{1,80}$/; // an opaque person id from the user capability ("u_…")
+const whoOf = x => typeof x === "string" && WHO_ID.test(x) ? x : null;
+function normFile(id, v) {
+  // copied key by key: JSON can carry an own "__proto__" key, which Object.assign would turn into a prototype
+  const f = {}; for (const k of Object.keys(v || {})) if (k !== "__proto__") f[k] = v[k]; f.id = id;
+  f.type = T.FILE_TYPES.includes(f.type) ? f.type : "data";
+  f.tags = [...new Set(A(f.tags).map(t => S(t).toLowerCase().replace(/^#/, "").trim()).filter(Boolean))];
+  f.links = A(f.links).filter(x => typeof x === "string");
+  f.kind = f.type === "note" ? (T.KINDS.includes(f.kind) ? f.kind : "note") : (f.kind ?? null);
+  f.x = N(f.x, 0); f.y = N(f.y, 0);
+  if (f.w != null) { f.w = N(f.w, undefined); if (f.w === undefined) delete f.w; }
+  if (f.h != null) { f.h = N(f.h, undefined); if (f.h === undefined) delete f.h; }
+  f.at = MS(f.at); f.updated = MS(f.updated) || f.at;
+  f.placed = f.placed === true || f.placed === "true"; f.fresh = f.fresh === true; f.done = f.done === true || f.done === "true";
+  f.by = BY.includes(f.by) ? f.by : "you";
+  for (const k of ["who", "ewho", "ranWho"]) { const w = whoOf(f[k]); if (w) f[k] = w; else delete f[k]; }
+  if (f.eby != null && !BY.includes(f.eby)) delete f.eby;
+  for (const k of ["rev", "prev"]) if (!(typeof f[k] === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(f[k]))) delete f[k]; // content versions: which one a write was made from
+  if ("url" in f) { f.url = safeUrl(f.url); if (!f.url) delete f.url; }
+  const c = f.content;
+  if (["note", "doc", "page", "program", "app"].includes(f.type)) f.content = S(c);
+  else if (f.type === "list") f.content = (typeof c === "string" ? T.decodeBody("list", c) : A(c)).filter(x => x != null).map(x => typeof x === "object" ? Object.assign({}, x, { text: S(x.text), done: !!x.done }) : { text: S(x), done: false });
+  else if (f.type === "table") { const t = typeof c === "string" ? T.decodeBody("table", c) : c && typeof c === "object" && !Array.isArray(c) ? c : Array.isArray(c) ? { cols: A(c[0]).map(S), rows: c.slice(1) } : { cols: [], rows: [] }; f.content = { cols: A(t.cols).map(S), rows: A(t.rows).filter(r => r != null).map(r => A(r)) }; if (Array.isArray(t.formats) && t.formats.some(Boolean)) f.content.formats = A(t.formats).map(S); }
+  else if (f.type === "link") { const l = typeof c === "string" ? T.decodeBody("link", c) : c && typeof c === "object" ? c : {}; f.content = { url: safeUrl(l.url) || "", title: S(l.title) }; }
+  f.name = S(f.name).slice(0, 80) || (f.type === "note" ? f.content.split("\n")[0].slice(0, 60) || "Note" : "Untitled " + f.type);
+  if (f.output != null) f.output = A(f.output).filter(l => l && typeof l === "object").map(l => ({ at: MS(l.at), kind: S(l.kind) || "out", text: S(l.text) }));
+  if (f.runRequest != null) f.runRequest = typeof f.runRequest === "object" ? Object.assign({}, f.runRequest, { at: MS(f.runRequest.at) }) : null;
+  if (f.ranAt != null) f.ranAt = MS(f.ranAt);
+  return f;
+}
+const normEvent = (id, v) => Object.assign({}, v, { id, at: MS(v.at), by: BY.includes(v.by) ? v.by : "you", who: whoOf(v.who), op: S(v.op) || "edit", text: S(v.text).slice(0, 400), ref: typeof v.ref === "string" ? v.ref : null });
+const normTurn = (id, v, ch, path) => ({ id, ch, path, text: typeof v.text === "string" ? v.text : null, agent: typeof v.agent === "string" ? v.agent.replace(/[\p{Cc}\p{Cf}]/gu, "").slice(0, 40) : null, read: MS(v.read) || null, applied: v.applied && typeof v.applied === "object" ? v.applied : null });
+
+const Store = {
+  mode: "starting", db: null, deskId: null, desks: new Map(), files: new Map(), events: [], version: 0, ready: false, tab: TAB,
+  turns: [],     // every turn this page may play, oldest first: { id, ch: "mine" | "shared", path, text, agent, read, applied }
+  live: null,    // desks/{id}/live/claude: kept for older pages that wrote it
+  cursor: null,  // how far the Claude of this page's channel has read: { at } (mine when signed in, else the shared one)
+  shared: { cursor: null }, // the shared channel's cursor (desks/{id}/cursors/claude), for editors' Claudes that use it
+  me: { id: null, isOwner: false, canEdit: null, canWrite: null, color: null }, // who is at this page, from the user capability
+  user: null,    // the user capability, when this view has it
+  people: new Map(), // id → { id, name, color, avatarUrl, guest, isMe } as this viewer sees them; never stored
+  peopleIds: [], // everyone who has been on this computer (people/*), newest first
+  marks: new Map(), // scope → Map(personId → { v, at }): what each person did in a built-in app or an app's c.setMy
+  actor: undefined, // while a Claude's turn plays: whose Claude it is ("" for the shared channel's)
+  on(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+  emit(what) { Store.version++; listeners.forEach(f => { try { f(what); } catch (e) { console.error(e); } }); },
+  list() { return [...Store.files.values()].sort((a, b) => (a.at || 0) - (b.at || 0)); },
+  desk() { return Store.desks.get(Store.deskId) || { title: "This conversation", inbox: null }; },
+  /* find a file by name; apps and other files may share a name, so a type narrows it */
+  byName(name, type) {
+    const all = Store.list().filter(f => f.name === name);
+    if (type) return all.find(f => f.type === type) || (type === "doc" && all.find(f => f.type === "note")) || null;
+    return all.find(f => f.type !== "app") || all[0] || null;
+  },
+  /* notes as thoughts: the shape streams, filters and the agent read */
+  notes() { return Store.list().filter(f => f.type === "note").map(f => ({ id: f.id, text: String(f.content ?? ""), kind: f.kind || "note", tags: f.tags || [], by: f.by, who: f.who || null, at: f.at, done: !!f.done, links: f.links || [], placed: !!f.placed, url: f.url, fresh: !!f.fresh })); },
+  norm: normFile, safeUrl,
+};
+/* who is acting right now: the person at this page, or (while a turn plays) the person whose Claude it is */
+const actorWho = () => Store.actor !== undefined ? (Store.actor || null) : Store.me.id;
+Store.actingAs = () => actorWho();
+Store.as = (who, fn) => { const prev = Store.actor; Store.actor = who == null ? "" : who; try { return fn(); } finally { Store.actor = prev; } };
+/* ---------- people: ids in, names out (resolved for this viewer, cached for the visit) ---------- */
+const PALETTE = ["#C15F3C", "#3F6E9A", "#6A7D3A", "#8A5A9C", "#B0872E", "#2F8577", "#A3485A", "#5B6472"];
+const colorFor = id => PALETTE[parseInt(T.fnv1a(String(id)).slice(0, 6), 16) % PALETTE.length];
+let resolveQ = new Set(), resolveT = null;
+function resolveSoon(id) {
+  resolveQ.add(id); if (resolveT) return;
+  resolveT = setTimeout(async () => {
+    const ids = [...resolveQ]; resolveQ = new Set(); resolveT = null;
+    if (!Store.user || typeof Store.user.profiles !== "function") return;
+    let ps = null; try { ps = await Store.user.profiles(ids); } catch (e) { ps = null; }
+    if (!ps) return;
+    let changed = false;
+    for (const id of ids) { const p = ps[id]; if (!p) continue; const cur = Store.people.get(id) || {}; const next = { id, name: S(p.name), color: S(p.color) || cur.color || colorFor(id), avatarUrl: S(p.avatarUrl) || null, guest: !!p.guest, isMe: id === Store.me.id, at: Date.now() }; if (stableish(cur) !== stableish(next)) changed = true; Store.people.set(id, next); }
+    if (changed) { Store.peopleV = (Store.peopleV || 0) + 1; Store.emit("people"); }
+  }, 40);
+}
+const stableish = p => [p.name, p.color, p.avatarUrl, p.guest].join("|");
+/** One person as this viewer sees them, now. Unknown ids resolve in the background (a "people" event follows). */
+Store.person = function (id) {
+  id = whoOf(id); if (!id) return null;
+  let p = Store.people.get(id);
+  if (!p) { p = { id, name: "", color: id === Store.me.id && Store.me.color ? Store.me.color : colorFor(id), avatarUrl: null, guest: false, isMe: id === Store.me.id, at: 0 }; Store.people.set(id, p); resolveSoon(id); }
+  else if (Date.now() - (p.at || 0) > 5 * 60 * 1000) { p.at = Date.now(); resolveSoon(id); } // names change; look again now and then
+  return p;
+};
+/** A short name for whoever did something: "You", "Ana", "Ana's Claude", "Claude". */
+Store.label = function (by, who, opts) {
+  const mine = who && who === Store.me.id, p = who ? Store.person(who) : null, nm = p && p.name ? p.name.split(/\s+/)[0] : "";
+  if (by === "claude") return !who ? "Claude" : mine ? (opts && opts.long ? "Your Claude" : "Claude") : nm ? `${nm}’s Claude` : "Someone’s Claude";
+  if (by === "agent") return !who || mine ? "Claude · canvas" : nm ? `${nm}’s canvas Claude` : "A canvas Claude";
+  if (!who) return Store.me.isOwner || !Store.me.id ? "You" : "The owner"; // written before this computer had names
+  return mine ? "You" : nm || (p && p.guest ? "A guest" : "Someone");
+};
+/* ---------- db: one write at a time per document ---------- */
+const chains = {};
+function write(path, fn, quiet) {
+  chains[path] = (chains[path] || Promise.resolve()).then(fn).then(() => true).catch(e => {
+    console.warn("Tanke store:", path, e);
+    // kept for Claude: which write failed and how, so a problem someone saw can be found
+    (Store.writeIssues = Store.writeIssues || []).unshift({ at: Date.now(), path: String(path).replace(/data\/users\/[^/]+/, "data/users/me"), code: (e && e.code) || null, message: String((e && e.message) || e).slice(0, 200), quiet: !!quiet }); Store.writeIssues.length = Math.min(Store.writeIssues.length, 8);
+    if (quiet) return;
+    Store.lastError = e && e.code === "quota_exceeded" ? "this desktop is full (25,000 records). Export it and start a new desktop" : e && e.code === "invalid_argument" && Store.me.canWrite === false ? "you can look at this desktop, but not change it (ask its owner for edit access)" : (e && e.message) || String(e);
+    Store.emit("error");
+    return false;
+  });
+  return chains[path];
+}
+/* our own writes win over snapshots until they land, so an edit never snaps back */
+const pend = new Map(), gone = new Set(), seqOf = new Map();
+/* the content each file had on the server when this page last heard: the base of a three-way merge */
+const known = new Map(), knownRev = new Map();
+/* my last content write to each file: { rev, prev, base, content, by, who, at }. Writes are last-writer-wins, so
+   two pages that write from the same version at once lose one change; the loser sees a newer version made from
+   the same one it used (prev), and merges its change back in. */
+const lastW = new Map();
+function watchLost(id, nf, lost) {
+  const w = lastW.get(id); if (!w || !nf.rev || nf.rev === w.rev) return;
+  if (nf.prev === w.rev || Date.now() - w.at > 30000) { lastW.delete(id); return; } // made from mine: nothing lost
+  if ((nf.prev || null) !== (w.prev || null)) return;
+  lastW.delete(id);
+  const merged = T.merge3(w.base, w.content, nf.content);
+  if (!T.same(merged, nf.content)) lost.push({ id, content: merged, by: w.by, who: w.who });
+}
+let unsub = [];
+function saveLocal() { if (Store.mode !== "local") return; clearTimeout(saveLocal.t); saveLocal.t = setTimeout(() => { lset("desk." + Store.deskId, { files: Store.list(), events: Store.events.slice(0, 600) }); lset("desks", [...Store.desks.entries()]); }, 200); }
+function retry(e) { if (e && e.code === "unavailable") { clearTimeout(retry.t); retry.t = setTimeout(() => Store.switchDesk(Store.deskId), 2000 + Math.random() * 2000); } }
+/* ---------- channels: where each Claude in a chat reads and writes ---------- */
+const myBase = () => Store.mode === "db" && Store.me.id ? "data/users/" + Store.me.id + "/claude-" + Store.deskId : null;
+Store.channel = function () {
+  const b = myBase();
+  return b ? { kind: "mine", view: b, turns: b + "/turns", read: b + "-read", artifactView: { collection: "data/users/me", doc_id: "claude-" + Store.deskId }, artifactTurns: "data/users/me/claude-" + Store.deskId + "/turns" }
+    : { kind: "shared", view: "claude/" + Store.deskId, turns: "claude/" + Store.deskId + "/turns", read: "desks/" + Store.deskId + "/cursors/claude", artifactView: { collection: "claude", doc_id: Store.deskId }, artifactTurns: "claude/" + Store.deskId + "/turns" };
+};
+let myTurns = [], sharedTurns = [];
+const byTurnId = (a, b) => a.id.localeCompare(b.id, "en", { numeric: true });
+function mergeTurns() { Store.turns = myTurns.slice().sort(byTurnId).concat(sharedTurns.slice().sort(byTurnId)); Store.emit("turns"); }
+function setCursors() { Store.cursor = myBase() ? Store.myCursor || null : Store.shared.cursor; }
+/* ---------- marks: what each person did in a built-in app, written only by them ---------- */
+const markPath = (who, desk) => "people/" + who + "/desks/" + desk;
+const markPend = new Map(); // scope → value: my marks not yet confirmed
+let peopleUnsub = null; const markUnsubs = new Map();
+Store.marksOn = () => Store.mode === "db" && !!Store.me.id && Store.me.canWrite !== false;
+function watchMarks(id) {
+  if (markUnsubs.has(id) || !whoOf(id) || markUnsubs.size >= 40) return;
+  const desk = Store.deskId;
+  markUnsubs.set(id, Store.db.doc(markPath(id, desk)).onSnapshot(d => {
+    if (desk !== Store.deskId) return;
+    const v = d.exists ? d.data() || {} : {}, marks = v.marks && typeof v.marks === "object" ? v.marks : {};
+    for (const m of Store.marks.values()) m.delete(id);
+    // my own cleared answers stay in the document as "null": rewrite it without them now and then, so it never only grows
+    if (id === Store.me.id && Object.values(marks).filter(x => x && x.j === "null").length > 20 && !watchMarks.compacting) {
+      watchMarks.compacting = true; const p = markPath(id, desk);
+      write(p, () => Store.db.doc(p).set({ at: Date.now(), marks: Object.fromEntries(Object.entries(marks).filter(([k, x]) => k !== "__proto__" && x && x.j !== "null")) }), true).then(() => { watchMarks.compacting = false; });
+    }
+    for (const [scope, x] of Object.entries(marks)) {
+      if (scope === "__proto__") continue;
+      if (!x || typeof x !== "object") continue;
+      let val; try { val = JSON.parse(S(x.j)); } catch (e) { continue; }
+      if (val === null || val === undefined) continue;
+      if (!Store.marks.has(scope)) Store.marks.set(scope, new Map());
+      Store.marks.get(scope).set(id, { v: val, at: MS(x.at) });
+    }
+    if (id === Store.me.id) for (const [scope, val] of markPend) { if (!Store.marks.has(scope)) Store.marks.set(scope, new Map()); if (val === null) Store.marks.get(scope).delete(id); else Store.marks.get(scope).set(id, { v: val, at: Date.now() }); }
+    Store.emit("marks");
+  }, () => {}));
+}
+function subscribeMarks() {
+  markUnsubs.forEach(u => { try { u(); } catch (e) {} }); markUnsubs.clear(); Store.marks = new Map(); markPend.clear();
+  if (!(Store.mode === "db" && Store.me.id)) return;
+  watchMarks(Store.me.id);
+  if (!peopleUnsub) peopleUnsub = Store.db.collection("people").onSnapshot(snap => {
+    const rows = snap.docs.map(d => ({ id: d.id, at: MS((d.data() || {}).at) })).filter(x => whoOf(x.id)).sort((a, b) => b.at - a.at);
+    Store.peopleIds = rows.map(x => x.id).slice(0, 39);
+    if (!Store.peopleIds.includes(Store.me.id)) Store.peopleIds.unshift(Store.me.id);
+    for (const [id, u] of markUnsubs) if (!Store.peopleIds.includes(id)) { try { u(); } catch (e) {} markUnsubs.delete(id); for (const m of Store.marks.values()) m.delete(id); }
+    Store.peopleIds.forEach(watchMarks); Store.emit("people");
+  }, () => {});
+  else Store.peopleIds.forEach(watchMarks);
+}
+/* being here: people/{me} says this person has been on this computer; people/{me}/desks/{desk} holds their marks */
+function join(desk) {
+  if (!Store.marksOn()) return;
+  const me = Store.me.id, now = Date.now(), p = markPath(me, desk);
+  write("people/" + me, () => Store.db.doc("people/" + me).set({ at: now }), true);
+  write(p, async () => { const s = await Store.db.doc(p).get(); if (s.exists) await Store.db.doc(p).update({ at: now }); else await Store.db.doc(p).set({ at: now, marks: {} }); }, true);
+}
+/** A scope names one thing people mark: "f_<dataFileId>" for a built-in app, "a_<appId>_<key>" for an app's c.setMy. */
+Store.markScope = (kind, id, key) => (kind + "_" + String(id) + (key != null ? "_" + T.slug(String(key)).replace(/-/g, "_") : "")).replace(/[^A-Za-z0-9_]/g, "_").slice(0, 120);
+/** Everyone's marks on a scope: [{ id, v, at, isMe }], oldest first. */
+Store.marksFor = scope => [...(Store.marks.get(scope) || new Map()).entries()].map(([id, x]) => ({ id, v: x.v, at: x.at, isMe: id === Store.me.id })).sort((a, b) => a.at - b.at);
+Store.myMark = scope => { const m = Store.marks.get(scope), x = m && Store.me.id && m.get(Store.me.id); return x ? x.v : undefined; };
+/** Set (or with null, clear) what I did on a scope. Everyone sees it; only I can change it. */
+Store.setMark = function (scope, value) {
+  if (!Store.marksOn()) return false;
+  const me = Store.me.id, at = Date.now(), p = markPath(me, Store.deskId), v = value === undefined ? null : clean(value);
+  if (!Store.marks.has(scope)) Store.marks.set(scope, new Map());
+  if (v === null) Store.marks.get(scope).delete(me); else Store.marks.get(scope).set(me, { v, at });
+  markPend.set(scope, v); Store.emit("marks");
+  const j = JSON.stringify(v);
+  if (j.length > 16000) { Store.lastError = "that answer is too long to keep (16,000 characters at most)"; Store.emit("error"); return false; }
+  const body = { at, marks: { [scope]: { j, at } } };
+  // set only creates the document: on an existing one it would replace every other answer this person gave
+  write(p, () => Store.db.doc(p).update(body).catch(async e => { if (e && e.code === "invalid_argument") { const s = await Store.db.doc(p).get(); if (!s.exists) return Store.db.doc(p).set(body); } throw e; })).then(() => { if (markPend.get(scope) === v) markPend.delete(scope); });
+  return true;
+};
+function subscribeDesk(id) {
+  unsub.forEach(f => { try { f(); } catch (e) {} }); unsub = [];
+  Store.files = new Map(); Store.events = []; Store.turns = []; myTurns = []; sharedTurns = []; Store.ready = false; Store.live = null; Store.cursor = null; Store.myCursor = null; Store.shared.cursor = null; pend.clear(); gone.clear(); known.clear();
+  if (Store.mode === "db") {
+    const base = "desks/" + id;
+    unsub.push(Store.db.collection(base + "/files").onSnapshot(snap => {
+      const m = new Map(), lost = [];
+      snap.docs.forEach(d => {
+        if (gone.has(d.id)) return; const v = d.data(); if (!v || typeof v !== "object") return;
+        try { const nf = normFile(d.id, v); if (!(d.metadata && d.metadata.hasPendingWrites) && !pend.has(d.id)) { known.set(d.id, nf.content); if (nf.rev) knownRev.set(d.id, nf.rev); else knownRev.delete(d.id); watchLost(d.id, nf, lost); } m.set(d.id, pend.get(d.id) || nf); } catch (e) { console.warn("Skipped a record", d.id, e); }
+      });
+      for (const [k, f] of pend) if (!m.has(k)) m.set(k, f);
+      Store.files = m; Store.ready = true; Store.emit("files");
+      // a change of mine that someone's write from the same version replaced: put it back, merged
+      if (lost.length) setTimeout(() => { for (const x of lost) if (Store.files.has(x.id)) Store.as(x.who, () => Store.update(x.id, { content: x.content }, x.by, false)); Store.merged = (Store.merged || 0) + 1; Store.emit("merged"); }, 0);
+    }, e => { Store.lastError = e.message; Store.ready = true; Store.emit("error"); retry(e); }));
+    unsub.push(Store.db.collection(base + "/events").orderBy("at", "desc").limit(400).onSnapshot(snap => { Store.events = snap.docs.map(d => normEvent(d.id, d.data() || {})); Store.emit("events"); }, retry));
+    unsub.push(Store.db.doc(base + "/live/claude").onSnapshot(d => { const v = d.data(); Store.live = v ? Object.assign({}, v, { at: MS(v.at), started: MS(v.started), stream: S(v.stream) }) : null; Store.emit("live"); }, retry));
+    unsub.push(Store.db.doc(base + "/cursors/claude").onSnapshot(d => { const v = d.data(); Store.shared.cursor = v ? Object.assign({}, v, { at: MS(v.at) }) : null; setCursors(); Store.emit("cursor"); }, retry));
+    // the shared channel: turns an editor's Claude writes to claude/{desk}/turns (only editors can write or play them)
+    unsub.push(Store.db.collection("claude/" + id + "/turns").onSnapshot(snap => { sharedTurns = snap.docs.map(d => normTurn(d.id, d.data() || {}, "shared", "claude/" + id + "/turns/" + d.id)); mergeTurns(); }, retry));
+    // my own channel: my Claude's turns and how far it has read, private to me
+    const mb = myBase();
+    if (mb) {
+      unsub.push(Store.db.collection(mb + "/turns").onSnapshot(snap => { myTurns = snap.docs.map(d => normTurn(d.id, d.data() || {}, "mine", mb + "/turns/" + d.id)); mergeTurns(); }, retry));
+      unsub.push(Store.db.doc(mb + "-read").onSnapshot(d => { const v = d.exists ? d.data() : null; Store.myCursor = v ? { at: MS(v.at) } : null; setCursors(); Store.emit("cursor"); }, retry));
+    }
+    subscribeMarks(); join(id);
+  } else {
+    const j = lget("desk." + id, null);
+    if (j) { Store.files = new Map((j.files || []).filter(f => f && f.id).map(f => [f.id, normFile(f.id, f)])); Store.events = j.events || []; }
+    Store.ready = true; setTimeout(() => Store.emit("files"), 0);
+  }
+}
+/* who is here: the user capability, asked once (it never rejects; null when this view has no viewer) */
+async function identify(user) {
+  if (!user) return;
+  Store.user = user;
+  try {
+    const me = await Promise.race([user.me(), new Promise(r => setTimeout(() => r(null), 6000))]);
+    if (me) Object.assign(Store.me, { id: whoOf(me.id), isOwner: !!me.isOwner, canEdit: !!me.canEdit, color: S(me.color) || null });
+    if (me && Store.me.id) Store.people.set(Store.me.id, { id: Store.me.id, name: S(me.name), color: S(me.color) || colorFor(Store.me.id), avatarUrl: S(me.avatarUrl) || null, guest: false, isMe: true, at: Date.now() });
+    if (typeof user.can === "function") { const cw = await user.can("data.write"); Store.me.canWrite = cw === true ? true : cw === false ? false : null; }
+  } catch (e) {}
+}
+/* the user capability answered late or not at all: ask again a few times; once it knows us, move to our own channel */
+function retryIdentify(user, n) {
+  if (n > 5) return;
+  setTimeout(async () => { await identify(user); if (Store.me.id) { Store.switchDesk(Store.deskId); Store.emit("me"); loadTrust(); } else retryIdentify(user, n + 1); }, 8000 * n);
+}
+Store.init = async function (preferred) {
+  let db = null, user = null;
+  const use = n => window.claude && typeof window.claude.use === "function" ? window.claude.use(n).catch(() => null) : Promise.resolve(null);
+  try { [db, user] = await Promise.all([use("db"), use("user")]); } catch (e) { db = null; }
+  await identify(user);
+  Store.mode = db ? "db" : "local"; Store.db = db;
+  if (db) {
+    await new Promise(resolve => {
+      let first = true;
+      unsub.desks = db.collection("desks").onSnapshot(snap => {
+        const m = new Map(); snap.docs.forEach(d => { const v = d.data() || {}; m.set(d.id, Object.assign({}, v, { id: d.id, title: S(v.title), at: MS(v.at), inbox: Array.isArray(v.inbox) && v.inbox.length === 2 ? v.inbox.map(n => N(n, 0)) : null })); });
+        Store.desks = m; Store.emit("desks");
+        if (first && !(snap.metadata && snap.metadata.fromCache && !snap.docs.length)) { first = false; resolve(); }
+      }, () => { if (first) { first = false; resolve(); } });
+      setTimeout(() => { if (first) { first = false; resolve(); } }, 4000);
+    });
+  } else Store.desks = new Map(lget("desks", []));
+  const ids = [...Store.desks.values()].sort((a, b) => (b.at || 0) - (a.at || 0)).map(d => d.id);
+  const pick = [preferred, lget("lastDesk", null)].find(x => x && (Store.desks.has(x) || x === preferred)) || ids[0] || "main";
+  Store.switchDesk(pick);
+  Store.emit("me");
+  loadTrust();
+  if (user && !Store.me.id) retryIdentify(user, 1);
+  return Store.mode;
+};
+Store.switchDesk = function (id) {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) id = "main";
+  Store.deskId = id; lset("lastDesk", id); subscribeDesk(id); Store.emit("desk");
+};
+function ensureDesk(by) {
+  if (Store.desks.has(Store.deskId)) return;
+  const d = { title: Store.deskId === "main" ? "My desktop" : Store.deskId.replace(/[-_]+/g, " "), at: Date.now(), by: by || "you", inbox: null };
+  const w = actorWho(); if (w) d.who = w;
+  Store.desks.set(Store.deskId, Object.assign({ id: Store.deskId }, d));
+  // never replace a desk that exists but had not arrived yet
+  if (Store.mode === "db") { const p = "desks/" + Store.deskId; write(p, async () => { const s = await Store.db.doc(p).get(); if (!s.exists) await Store.db.doc(p).set(clean(d)); }); } else saveLocal();
+}
+Store.createDesk = function (title, by) {
+  const id = (T.slug(title).slice(0, 40) || "desk") + "-" + Date.now().toString(36).slice(-4);
+  const d = { title: String(title || "New desktop"), at: Date.now(), by: by || "you", inbox: null };
+  const w = actorWho(); if (w) d.who = w;
+  Store.desks.set(id, Object.assign({ id }, d)); Store.emit("desks");
+  if (Store.mode === "db") write("desks/" + id, () => Store.db.doc("desks/" + id).set(clean(d))); else lset("desks", [...Store.desks.entries()]);
+  return id;
+};
+Store.updateDesk = function (patch) {
+  ensureDesk(); const d = Object.assign({}, Store.desk(), patch); delete d.id;
+  Store.desks.set(Store.deskId, Object.assign({ id: Store.deskId }, d)); Store.emit("desks");
+  if (Store.mode === "db") write("desks/" + Store.deskId, () => Store.db.doc("desks/" + Store.deskId).update(clean(patch)).catch(() => Store.db.doc("desks/" + Store.deskId).set(clean(d)))); else saveLocal();
+};
+/* ---------- files ---------- */
+const filePath = id => "desks/" + Store.deskId + "/files/" + id;
+const docOf = f => { const { id, ...doc } = f; return doc; };
+const bump = id => { const n = (seqOf.get(id) || 0) + 1; seqOf.set(id, n); return n; };
+function landed(id, n) { return () => { if (seqOf.get(id) === n) pend.delete(id); }; }
+function put(f) {
+  ensureDesk(f.by);
+  // a whole-document write (a new file, an undo, a restore) is a new version too, made from the one the server has
+  f = Object.assign({}, f, { rev: uid("v") }); if (knownRev.get(f.id)) f.prev = knownRev.get(f.id); else delete f.prev;
+  gone.delete(f.id); Store.files.set(f.id, f); Store.emit("files");
+  if (Store.mode === "db") { pend.set(f.id, f); const n = bump(f.id), p = filePath(f.id); write(p, () => Store.db.doc(p).set(clean(docOf(Store.files.get(f.id) || f)))).then(() => { known.set(f.id, clean((Store.files.get(f.id) || f).content ?? null)); landed(f.id, n)(); }); } else saveLocal();
+}
+/* someone else may have changed the content since this page last heard: read it, merge, and write what keeps both */
+async function rebase(id, p) {
+  const cur = Store.files.get(id); if (!cur) return undefined;
+  const mine = cur.content, base = known.get(id);
+  let theirs, out = mine, server;
+  let raw = null;
+  try { const s = await Store.db.doc(p).get(); if (!s.exists) return { gone: true }; raw = s.data() || {}; server = normFile(id, raw); theirs = server.content; } catch (e) { return { content: mine, from: null, base: mine }; }
+  if (base !== undefined && !T.same(theirs, base) && !T.same(theirs, mine)) {
+    out = T.merge3(clean(base), mine, theirs);
+    if (!T.same(out, mine)) { const nf = normFile(id, Object.assign({}, cur, { content: out })); Store.files.set(id, nf); if (pend.has(id)) pend.set(id, nf); Store.merged = (Store.merged || 0) + 1; Store.emit("files"); Store.emit("merged"); }
+  }
+  known.set(id, clean(out ?? null));
+  return { content: out, from: server.rev || null, base: theirs, raw };
+}
+/* a change is a merge of the fields that changed, so a move never erases what someone else wrote meanwhile */
+function putPatch(nf, patch) {
+  Store.files.set(nf.id, nf); Store.emit("files");
+  if (Store.mode !== "db") { saveLocal(); return; }
+  pend.set(nf.id, nf); const n = bump(nf.id);
+  const p = filePath(nf.id), id = nf.id;
+  const by = patch.eby || "you", who = patch.ewho || actorWho();
+  write(p, async () => {
+    let body = Object.assign({}, patch), w = null, server = null;
+    if ("content" in body) {
+      const r = await rebase(id, p);
+      if (r && r.gone) return; // someone deleted it meanwhile: a write must not bring it back
+      if (r) {
+        server = r.raw || null;
+        // every content write names its version and the version it was made from
+        const rev = uid("v"), cur = Store.files.get(id);
+        body.content = r.content; body.rev = rev; if (r.from) body.prev = r.from; else delete body.prev;
+        if (cur) { const nf2 = Object.assign({}, cur, { rev }); if (r.from) nf2.prev = r.from; else delete nf2.prev; Store.files.set(id, nf2); if (pend.has(id)) pend.set(id, nf2); }
+        w = { rev, prev: r.from, base: clean(r.base ?? null), content: clean(r.content ?? null), by, who, at: 0 };
+      }
+    }
+    // an object field (table content, a run request) must replace, not merge, so it goes as a whole document:
+    // the server's fields as they are now, with only this change on top (never this page's stale copy of the rest)
+    const whole = Object.values(body).some(v => v && typeof v === "object" && !Array.isArray(v));
+    const full = async () => { if (!server) { const s2 = await Store.db.doc(p).get(); if (!s2.exists) return; server = s2.data() || {}; } const doc = Object.assign({}, server, body); delete doc.id; if (!("prev" in body)) delete doc.prev; return Store.db.doc(p).set(clean(doc)); };
+    await (whole ? full() : Store.db.doc(p).update(clean(body)).catch(async e => { if (e && e.code === "invalid_argument") { const s2 = await Store.db.doc(p).get(); if (s2.exists) throw e; return; } throw e; }));
+    if (w) { w.at = Date.now(); lastW.set(id, w); }
+  }).then(landed(id, n));
+}
+function nameFor(f) {
+  if (f.name) return String(f.name).slice(0, 80);
+  if (f.type === "note") return String(f.content || "").split("\n")[0].slice(0, 60) || "Note";
+  const base = { doc: "Untitled doc", list: "Untitled list", table: "Untitled table", data: "Data", link: "Link", page: "Untitled page", program: "Untitled program", app: "Untitled app" }[f.type] || "File";
+  let n = base, i = 2; while (Store.byName(n, f.type)) n = base + " " + i++; return n;
+}
+Store.add = function (f, by, op) {
+  const now = Date.now(), who = actorWho();
+  const type = T.FILE_TYPES.includes(f.type) ? f.type : "note";
+  const raw = Object.assign({ id: f.id || uid("f"), type, content: T.SEEDS[type] !== undefined ? clean(T.SEEDS[type]) : null, kind: type === "note" ? "note" : null, tags: [], done: false, links: [], placed: type !== "note", x: 0, y: 0, by: by || "you", at: now, updated: now }, f, { type });
+  if (who) { raw.who = who; raw.ewho = who; } raw.eby = raw.by;
+  raw.name = nameFor(raw);
+  const file = normFile(raw.id, raw);
+  file.fresh = file.by !== "you";
+  trustMine(file, file.content);
+  put(file);
+  Store.log(op || (type === "note" ? "capture" : "create"), type === "note" ? file.content : `${type} “${file.name}”`, file.id, file.by, file.kind || type);
+  return file;
+};
+/* opts.base: the content the change was made from (an editor that did not take the latest while someone typed in it);
+   when the file has moved on since, the change is merged into what is there now instead of replacing it */
+Store.update = function (id, patch, by, op, what, opts) {
+  const f = Store.files.get(id); if (!f) return null;
+  if (opts && opts.base !== undefined && "content" in patch && !T.same(opts.base, f.content)) {
+    const merged = T.merge3(clean(opts.base), patch.content, f.content);
+    if (!T.same(merged, patch.content)) { patch = Object.assign({}, patch, { content: merged }); Store.merged = (Store.merged || 0) + 1; setTimeout(() => Store.emit("merged"), 0); }
+  }
+  // a person's own changes can be undone with ⌘Z, like any desktop app
+  if ((by || "you") === "you" && op !== false && op !== "undo" && "content" in patch) Store.remember(f);
+  const now = Date.now(), p = Object.assign({}, patch); delete p.id;
+  // a file Claude touched glows until a person touches it
+  p.fresh = by && by !== "you" ? true : patch.fresh !== undefined ? !!patch.fresh : false;
+  p.updated = now;
+  // who changed it last: kept with the file, so everyone (and every Claude) sees whose change it was
+  if (op !== false || "content" in patch) { p.eby = by || "you"; const w = actorWho(); if (w) p.ewho = w; }
+  if (f.type === "note" && p.content !== undefined && !p.name) p.name = String(p.content).split("\n")[0].slice(0, 60) || "Note";
+  const nf = normFile(id, Object.assign({}, f, p));
+  for (const k of Object.keys(p)) if (k in nf) p[k] = nf[k]; else delete p[k];
+  if ("content" in p) trustMine(nf, nf.content);
+  putPatch(nf, p);
+  // Claude's edits keep what was there before, so a person can undo them from the log
+  let before = null; if (by && by !== "you" && op !== false) { try { const j = JSON.stringify(f); if (j.length < 60000) before = JSON.parse(j); } catch (e) {} }
+  if (op !== false) Store.log(op || "edit", what || (nf.type === "note" ? nf.content : `${nf.type} “${nf.name}”`), id, by || "you", nf.kind || nf.type, before ? { before } : null);
+  return nf;
+};
+Store.remove = function (id, by) {
+  const f = Store.files.get(id); if (!f) return false;
+  Store.files.delete(id); pend.delete(id);
+  for (const o of Store.files.values()) if ((o.links || []).includes(id)) Store.update(o.id, { links: o.links.filter(x => x !== id) }, by, false);
+  Store.emit("files");
+  if (Store.mode === "db") { gone.add(id); const p = filePath(id); write(p, () => Store.db.doc(p).delete()).then(() => gone.delete(id)); } else saveLocal();
+  Store.log("delete", f.type === "note" ? f.content : `${f.type} “${f.name}”`, id, by || "you", f.kind || f.type);
+  return f;
+};
+/* undo and redo for a person's own edits: the content before each change, newest last */
+const undoStack = [], redoStack = [];
+Store.remember = function (f) { let c; try { c = JSON.parse(JSON.stringify(f.content ?? null)); } catch (e) { return; } const top = undoStack[undoStack.length - 1]; if (top && top.id === f.id && Date.now() - top.at < 800) return; undoStack.push({ id: f.id, name: f.name, content: c, at: Date.now() }); if (undoStack.length > 100) undoStack.shift(); redoStack.length = 0; };
+Store.undoMine = function (redo) {
+  const from = redo ? redoStack : undoStack, to = redo ? undoStack : redoStack;
+  while (from.length) { const u = from.pop(), f = Store.files.get(u.id); if (!f) continue; to.push({ id: f.id, name: f.name, content: JSON.parse(JSON.stringify(f.content ?? null)), at: 0 }); Store.update(f.id, { content: u.content }, "you", "undo", `${redo ? "Redid" : "Undid"} a change to “${String(f.name).replace(/ · data$/, "")}”`); return f; }
+  return null;
+};
+Store.restore = function (f) { put(normFile(f.id, Object.assign({}, f, { updated: Date.now() }))); Store.log("restore", f.type === "note" ? f.content : `${f.type} “${f.name}”`, f.id, "you", f.kind || f.type); };
+/* ---------- the log: edits to one file within a minute are one entry, and old entries are pruned ---------- */
+const MERGE = ["edit", "move", "program", "place"];
+let logged = 0;
+Store.log = function (op, text, ref, by, kind, extra) {
+  ensureDesk(by);
+  const now = Date.now(), who = by || "you", whoId = actorWho(), prev = Store.events[0];
+  const merge = prev && !prev.before && !(extra && extra.before) && (MERGE.includes(op) || op === "act" && prev.text === String(text ?? "").slice(0, 400)) && prev.op === op && ref && prev.ref === ref && prev.by === who && (prev.who || null) === (whoId || null) && now - prev.at < 60000;
+  const id = merge ? prev.id : uid("e");
+  const ev = Object.assign({ at: now, by: who, op, text: String(text ?? "").slice(0, 400), ref: ref || null, kind: kind || null }, whoId ? { who: whoId } : {}, extra || {});
+  Store.events = [Object.assign({ id, who: whoId || null }, ev)].concat(merge ? Store.events.slice(1) : Store.events).slice(0, 600); Store.emit("events");
+  if (Store.mode === "db") { const p = "desks/" + Store.deskId + "/events/" + id; write(p, () => Store.db.doc(p).set(clean(ev))); if (!merge && ++logged % 80 === 0) prune(); } else saveLocal();
+};
+async function prune() {
+  try {
+    const base = "desks/" + Store.deskId + "/events", snap = await Store.db.collection(base).orderBy("at", "desc").limit(1000).get();
+    for (const d of snap.docs.slice(600, 800)) await Store.db.doc(base + "/" + d.id).delete();
+  } catch (e) {}
+}
+/* undo one of Claude's changes: an edit goes back to what it replaced, a new file goes away */
+Store.canUndo = ev => !!ev && ev.by !== "you" && !ev.undone && (ev.before ? true : ["create", "capture"].includes(ev.op) && !!ev.ref && Store.files.has(ev.ref));
+Store.undo = function (ev) {
+  if (!Store.canUndo(ev)) return false;
+  if (ev.before) { const id = ev.before.id || ev.ref; if (!id) return false; const b = normFile(id, Object.assign({}, ev.before, { updated: Date.now(), fresh: false })); put(b); Store.log("restore", `Undid ${Store.label(ev.by, ev.who)}’s change to ${b.type === "note" ? "a note" : "“" + b.name + "”"}`, b.id, "you", b.kind || b.type); }
+  else Store.remove(ev.ref, "you");
+  if (Store.mode === "db" && ev.id) { const p = "desks/" + Store.deskId + "/events/" + ev.id; write(p, () => Store.db.doc(p).update({ undone: true })); }
+  ev.undone = true; Store.emit("events");
+  return true;
+};
+/* ---------- Claude in the chat: the view it reads, the turns it writes ---------- */
+/* one tab applies a turn: a short lease on the turn document, then a check that nobody applied it */
+const within = (p, ms, what) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(Object.assign(new Error(what + " took too long"), { code: "timeout" })), ms))]);
+/* opts.alone: no other tab of mine is open, so nobody else could play my channel's turns */
+Store.claimTurn = async function (t, opts) {
+  if (Store.mode !== "db" || !t || !t.path) return null;
+  const ref = Store.db.doc(t.path), mine = t.ch === "mine" && Store.me.id;
+  // my channel is private, so its lease lives where only I can write and every tab of mine can see: people/{me}/leases
+  const lease = mine ? Store.db.doc("people/" + Store.me.id + "/leases/claude-" + Store.deskId) : ref;
+  let r = null, leaseErr = null;
+  try { r = await within(lease.acquire({ holder: TAB, ttlMs: mine ? 30000 : 120000 }), 10000, "claiming the turn"); } catch (e) { leaseErr = e; }
+  if (!(r && r.acquired)) {
+    // busy means another tab plays it: never play then. Only a lease that fails outright, on my own channel, with the room
+    // settled and no other tab of mine in it, lets this tab play without one (nobody else can see my channel)
+    if (!(leaseErr && mine && opts && opts.alone && opts.settled)) { Store.turnIssue = leaseErr ? `could not claim ${t.id}: ${leaseErr.code || leaseErr.message}` : `${t.id} is being played in another tab`; return null; }
+    Store.turnIssue = `played ${t.id} without a lease (${leaseErr ? leaseErr.code || leaseErr.message : "not granted"})`;
+  } else Store.turnIssue = null;
+  try {
+    const s = await within(ref.get(), 10000, "reading the turn"), v = s.exists ? s.data() : null;
+    return v && typeof v.text === "string" && !v.applied ? v : null;
+  } catch (e) { Store.turnIssue = `could not read ${t.id}: ${e.code || e.message}`; return null; }
+};
+Store.finishTurn = (t, applied) => {
+  if (!t) return;
+  applied = Object.assign({}, applied, { results: (applied.results || []).slice(0, 40).map(r => String(r).slice(0, 200)), errors: (applied.errors || []).slice(0, 6) });
+  const x = Store.turns.find(y => y.path === t.path); if (x) x.applied = applied;
+  if (Store.mode !== "db" || !t.path) return;
+  // recording the outcome is what stops the turn being played again: keep trying for a while
+  const attempt = n => write(t.path, () => Store.db.doc(t.path).update(clean({ applied })), true).then(ok => { if (!ok && n < 5) setTimeout(() => attempt(n + 1), 1500 * Math.pow(2, n)); });
+  attempt(0);
+};
+/* the view goes to the channel it is for: my Claude's (private), or the shared one an editor's Claude reads */
+Store.writeView = (view, kind) => { if (Store.mode !== "db") return Promise.resolve(false); const p = kind === "shared" ? "claude/" + Store.deskId : myBase(); if (!p) return Promise.resolve(false); return write(p, () => Store.db.doc(p).set(clean(view)), true); };
+Store.setCursor = (at, kind) => {
+  if (Store.mode !== "db" || !at) return;
+  const mine = kind !== "shared" && myBase();
+  const cur = mine ? Store.myCursor : Store.shared.cursor; if (cur && cur.at >= at) return;
+  if (mine) Store.myCursor = { at }; else Store.shared.cursor = { at };
+  setCursors(); Store.emit("cursor");
+  const p = mine ? myBase() + "-read" : "desks/" + Store.deskId + "/cursors/claude";
+  write(p, () => Store.db.doc(p).set({ at }), true);
+};
+/* ---------- trust: code someone else wrote runs on my page only after I say so ----------
+   Apps and libraries run as JavaScript in this page, and programs run on my computer. Anyone who can
+   change the desktop can write them, and every "who" field in a file is just data anyone could set.
+   So what may run is decided here, per person: the SHA-256 of the code, in a list only I can write
+   (data/users/{me}/trust). Code I or my own Claude write is added as it is written; anything else
+   waits for my "Run it". Built-in apps are code the page itself generates and always run. */
+const Trust = { hashes: new Map(), pending: new Set(), ok: new Set(), loaded: false, seeded: false, mine: new Set() }; // mine: texts this page just wrote, trusted before their hash is ready
+const hexOf = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+Trust.hashOf = function (text) {
+  text = String(text ?? ""); const h = Trust.hashes.get(text); if (h) return h;
+  if (!Trust.pending.has(text) && window.crypto && crypto.subtle) {
+    Trust.pending.add(text);
+    crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)).then(b => { Trust.hashes.set(text, hexOf(b)); Trust.pending.delete(text); if (Trust.hashes.size > 400) Trust.hashes.delete(Trust.hashes.keys().next().value); Store.emit("trust"); }, () => Trust.pending.delete(text));
+  }
+  return null;
+};
+const builtIn = f => f.type === "app" && f.kit && T.KITS && T.KITS[f.kit] && String(f.content) === T.kitCode(f.kit, f.name);
+/** May this app, library or program run on my page? (A pending hash answers false, then a "trust" event follows.) */
+Trust.trusted = function (f) {
+  if (!f) return false;
+  if (Store.mode !== "db" || builtIn(f)) return true; // a copy outside Claude has only its own files; built-in apps are the page's own code
+  if (Trust.mine.has(String(f.content ?? ""))) return true;
+  if (!Trust.loaded) return false;
+  const h = Trust.hashOf(f.content); return !!h && Trust.ok.has(h);
+};
+const trustPath = () => Store.me.id ? "data/users/" + Store.me.id + "/trust" : null;
+let trustT = null;
+function saveTrust() { clearTimeout(trustT); trustT = setTimeout(() => { const p = trustPath(); if (!p || Store.mode !== "db") return; const h = [...Trust.ok].slice(-1500); write(p, () => Store.db.doc(p).set({ h, at: Date.now() }), true); }, 400); }
+/** Trust this code (by its text): it runs from now on, on every device I use. */
+Trust.allow = async function (text) {
+  text = String(text ?? "");
+  let h = Trust.hashes.get(text);
+  if (!h && window.crypto && crypto.subtle) { h = hexOf(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))); Trust.hashes.set(text, h); }
+  if (!h || Trust.ok.has(h)) return; Trust.ok.add(h); saveTrust(); Store.emit("trust");
+};
+/* my list, read once; on the owner's first visit everything already here is trusted (it was theirs before people came) */
+async function loadTrust() {
+  Trust.loaded = false; Trust.ok = new Set();
+  const p = trustPath();
+  if (!p || Store.mode !== "db") { Trust.loaded = true; Store.emit("trust"); return; }
+  let v = null; try { const s = await Store.db.doc(p).get(); v = s.exists ? s.data() : null; } catch (e) { v = null; }
+  if (v && Array.isArray(v.h)) v.h.forEach(x => typeof x === "string" && /^[0-9a-f]{64}$/.test(x) && Trust.ok.add(x));
+  Trust.loaded = true;
+  if (!v && Store.me.isOwner) { Trust.seedOnReady = true; }
+  Store.emit("trust");
+}
+Store.on(what => {
+  if (what === "files" && Trust.seedOnReady && Store.ready) { Trust.seedOnReady = false; for (const f of Store.list()) if ((f.type === "app" || f.type === "program") && !builtIn(f)) Trust.allow(f.content); saveTrust(); }
+});
+/* what I and my own Claude write is mine: trusted as it is written */
+function trustMine(f, content) {
+  if (!f || !(f.type === "app" || f.type === "program") || Store.mode !== "db") return;
+  const w = actorWho(); if (w && w === Store.me.id) { const t = String(content ?? ""); Trust.mine.add(t); if (Trust.mine.size > 60) Trust.mine.delete(Trust.mine.values().next().value); Trust.allow(t); }
+}
+T.Trust = Trust;
+T.Store = Store;
+})();
+;
+/* ==========================================================================
+   TANKE DESKTOP · files and apps as objects on one spatial canvas.
+   The world is a DOM layer moved by the camera (pan, zoom, pinch). Each
+   placed file is an object: notes are cards, docs, lists, tables, data and
+   links are editable in place, apps are frames that render a Tanke program.
+   Apps' streams claim notes that are not placed by hand; whatever no app
+   claims sits in the Inbox, so nothing captured is hidden.
+   Hands write to the shared store: drag a note into a zone to assign it,
+   drop it on open canvas to place it, drag the round handle to link,
+   double-click to capture, drag a header to move, the corner to resize.
+   ========================================================================== */
+(function () {
+"use strict";
+const T = window.Tanke, Store = T.Store;
+const el = (tag, attrs, ...kids) => { const e = document.createElement(tag); if (attrs) for (const [k, v] of Object.entries(attrs)) { if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else if (v != null && v !== false) e.setAttribute(k, v === true ? "" : v); } for (const k of kids.flat()) if (k != null && k !== false) e.append(k.nodeType ? k : document.createTextNode(String(k))); return e; };
+/* ==========================================================================
+   ICONS · one 16px line set for the whole computer: the selection bar, the
+   launcher, window title bars and icon() in apps. Each is SVG inner markup on
+   a 16×16 grid, drawn with currentColor at a 1.4 stroke.
+   APP_ICON maps a kind of file or built-in app to a glyph and a brand colour,
+   so a document always looks like a document wherever it appears.
+   ========================================================================== */
+const ICONS = {
+  edit: '<path d="M10.5 2.5l3 3L6 13H3v-3z"/><path d="M9 4l3 3"/>',
+  focus: '<path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/>',
+  unfocus: '<path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5"/>',
+  rename: '<path d="M3 4.5h6M6 4.5v8M11.5 3v10M10 3h3M10 13h3"/>',
+  duplicate: '<rect x="5" y="5" width="8.5" height="8.5" rx="1"/><path d="M11 5V3.5a1 1 0 0 0-1-1H3.5a1 1 0 0 0-1 1V10a1 1 0 0 0 1 1H5"/>',
+  export: '<path d="M8 2.5v8M5 5.5l3-3 3 3"/><path d="M3 9.5v3a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-3"/>',
+  tuck: '<path d="M2.5 9.5h3l1 2h3l1-2h3"/><path d="M2.5 9.5l1.5-6h8l1.5 6v3.5h-11z"/>',
+  delete: '<path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5"/>',
+  more: '<circle cx="3.5" cy="8" r=".6"/><circle cx="8" cy="8" r=".6"/><circle cx="12.5" cy="8" r=".6"/>',
+  search: '<circle cx="7" cy="7" r="4.2"/><path d="M10.2 10.2l3.3 3.3"/>',
+  plus: '<path d="M8 3v10M3 8h10"/>',
+  close: '<path d="M4 4l8 8M12 4l-8 8"/>',
+  check: '<path d="M3 8.5l3 3 7-7"/>',
+  back: '<path d="M10 3L5 8l5 5"/>',
+  next: '<path d="M6 3l5 5-5 5"/>',
+  play: '<path d="M5 3l8 5-8 5z"/>',
+  apps: '<rect x="2.5" y="2.5" width="4.5" height="4.5" rx=".8"/><rect x="9" y="2.5" width="4.5" height="4.5" rx=".8"/><rect x="2.5" y="9" width="4.5" height="4.5" rx=".8"/><rect x="9" y="9" width="4.5" height="4.5" rx=".8"/>',
+  claude: '<path d="M8 2v3.5M8 10.5V14M2 8h3.5M10.5 8H14M3.8 3.8l2.4 2.4M9.8 9.8l2.4 2.4M12.2 3.8L9.8 6.2M6.2 9.8l-2.4 2.4"/>',
+  doc: '<path d="M4 2.5h5.5L12.5 5.5V13.5H4z"/><path d="M9.5 2.5v3h3M6 8h4.5M6 10.5h4.5"/>',
+  sheet: '<rect x="2.5" y="3" width="11" height="10" rx="1"/><path d="M2.5 6.5h11M2.5 10h11M6.5 3v10"/>',
+  slides: '<rect x="2" y="3" width="12" height="8" rx="1"/><path d="M8 11v2.5M5.5 13.5h5"/>',
+  canvas: '<rect x="2" y="3" width="5" height="4" rx=".8"/><circle cx="11.5" cy="11" r="2.5"/><path d="M7 5h2.5a2 2 0 0 1 2 2v1.5"/>',
+  site: '<circle cx="8" cy="8" r="5.5"/><path d="M2.5 8h11M8 2.5c1.8 2 1.8 9 0 11M8 2.5c-1.8 2-1.8 9 0 11"/>',
+  board: '<rect x="2" y="2.5" width="3.5" height="11" rx=".8"/><rect x="6.25" y="2.5" width="3.5" height="7" rx=".8"/><rect x="10.5" y="2.5" width="3.5" height="9" rx=".8"/>',
+  records: '<ellipse cx="8" cy="4" rx="5" ry="1.8"/><path d="M3 4v8c0 1 2.2 1.8 5 1.8s5-.8 5-1.8V4M3 8c0 1 2.2 1.8 5 1.8s5-.8 5-1.8"/>',
+  quiz: '<path d="M5.8 6a2.2 2.2 0 1 1 3.2 2c-.7.4-1 .9-1 1.6v.4"/><circle cx="8" cy="12.5" r=".5"/>',
+  poll: '<path d="M3 13.5V8M6.5 13.5V4M10 13.5V6.5M13.5 13.5V10"/>',
+  form: '<rect x="2.5" y="2.5" width="11" height="3" rx=".8"/><rect x="2.5" y="7" width="11" height="3" rx=".8"/><path d="M2.5 12.5h5"/>',
+  chart: '<path d="M2.5 13.5h11M3 11l3.5-4 3 2.5 4-5"/>',
+  timeline: '<path d="M4 2.5v11"/><circle cx="4" cy="4.5" r="1.4"/><circle cx="4" cy="11.5" r="1.4"/><path d="M7 4.5h6M7 11.5h4"/>',
+  cards: '<rect x="2" y="4" width="5.5" height="8" rx=".8"/><rect x="8.5" y="4" width="5.5" height="8" rx=".8"/>',
+  list: '<rect x="2.5" y="3" width="3" height="3" rx=".6"/><path d="M3.2 4.5l.8.8 1.4-1.6M7.5 4.5h6"/><rect x="2.5" y="10" width="3" height="3" rx=".6"/><path d="M7.5 11.5h6"/>',
+  note: '<path d="M3 2.5h10v7l-4 4H3z"/><path d="M9 13.5v-4h4"/>',
+  app: '<rect x="2" y="3" width="12" height="10" rx="1"/><path d="M2 6h12"/><circle cx="4" cy="4.5" r=".4"/><circle cx="5.6" cy="4.5" r=".4"/>',
+  program: '<rect x="2" y="3" width="12" height="10" rx="1"/><path d="M4.5 7l2 1.5-2 1.5M8 10.5h3"/>',
+  page: '<path d="M5.5 5L3 8l2.5 3M10.5 5L13 8l-2.5 3M9 3.5l-2 9"/>',
+  data: '<path d="M6 2.5c-1.5 0-1.5 1-1.5 2.5S3.5 8 3 8c.5 0 1.5 1 1.5 3s0 2.5 1.5 2.5M10 2.5c1.5 0 1.5 1 1.5 2.5s1 3 1.5 3c-.5 0-1.5 1-1.5 3s0 2.5-1.5 2.5"/>',
+  link: '<path d="M7 9a3 3 0 0 0 4.2 0l2-2a3 3 0 0 0-4.2-4.2l-.8.8"/><path d="M9 7a3 3 0 0 0-4.2 0l-2 2A3 3 0 0 0 7 13.2l.8-.8"/>',
+  person: '<circle cx="8" cy="5.5" r="2.8"/><path d="M2.8 13.5c.6-2.6 2.6-4 5.2-4s4.6 1.4 5.2 4"/>',
+  mail: '<rect x="2" y="3.5" width="12" height="9" rx="1"/><path d="M2.5 4.5L8 9l5.5-4.5"/>',
+  calendar: '<rect x="2.5" y="3.5" width="11" height="10" rx="1"/><path d="M2.5 7h11M5.5 2v3M10.5 2v3"/>',
+  clock: '<circle cx="8" cy="8" r="5.5"/><path d="M8 5v3.2l2 1.3"/>',
+  star: '<path d="M8 2.3l1.8 3.7 4 .6-2.9 2.8.7 4L8 11.5l-3.6 1.9.7-4-2.9-2.8 4-.6z"/>',
+  heart: '<path d="M8 13.2S2.5 10 2.5 6.2A2.8 2.8 0 0 1 8 4.8a2.8 2.8 0 0 1 5.5 1.4C13.5 10 8 13.2 8 13.2z"/>',
+  flag: '<path d="M3.5 14V2.5M3.5 3h8.5l-2 3 2 3H3.5"/>',
+  folder: '<path d="M2 4.5a1 1 0 0 1 1-1h3.2l1.3 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>',
+  gear: '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"/>',
+  home: '<path d="M2.5 7.5L8 3l5.5 4.5V13a.5.5 0 0 1-.5.5H9.5V10h-3v3.5H3a.5.5 0 0 1-.5-.5z"/>',
+  image: '<rect x="2" y="3" width="12" height="10" rx="1"/><circle cx="5.5" cy="6.5" r="1.2"/><path d="M2.5 12l3.5-3.5 2.5 2.5 2-2 3 3"/>',
+  chat: '<path d="M2.5 3.5h11v7.5H7l-3 2.5V11H2.5z"/>',
+  bolt: '<path d="M9 1.8L3.5 9H8l-1 5.2L12.5 7H8z"/>',
+  tag: '<path d="M2.5 2.5h5.2l6 6-5.2 5.2-6-6z"/><circle cx="5.3" cy="5.3" r=".8"/>',
+  pin: '<path d="M8 14s4.5-4.2 4.5-7.5a4.5 4.5 0 0 0-9 0C3.5 9.8 8 14 8 14z"/><circle cx="8" cy="6.5" r="1.6"/>',
+  lock: '<rect x="3" y="7" width="10" height="7" rx="1"/><path d="M5 7V5a3 3 0 0 1 6 0v2"/>',
+  money: '<rect x="1.8" y="4" width="12.4" height="8" rx="1"/><circle cx="8" cy="8" r="1.8"/><path d="M4 6.2v3.6M12 6.2v3.6"/>',
+  bold: '<path d="M4.5 2.8h4.2a2.6 2.6 0 0 1 0 5.2H4.5zM4.5 8h5a2.6 2.6 0 0 1 0 5.2h-5z"/>',
+  italic: '<path d="M7 2.8h5M4 13.2h5M9.5 2.8l-3 10.4"/>',
+  strike: '<path d="M2.5 8h11M11 4.5c-.5-1.2-1.6-1.8-3-1.8-1.8 0-3 .9-3 2.3M5 11.2c.5 1.3 1.6 2 3 2 1.9 0 3.2-1 3.2-2.4"/>',
+  code: '<path d="M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5"/>',
+  bullets: '<circle cx="3.5" cy="4.5" r=".7"/><circle cx="3.5" cy="8" r=".7"/><circle cx="3.5" cy="11.5" r=".7"/><path d="M6.5 4.5h7M6.5 8h7M6.5 11.5h7"/>',
+  numbers: '<path d="M2.6 3.4l1-.6v3.4M2.5 9.8c0-.6.5-1 1.1-1s1 .4 1 .9c0 .9-2.1 1.6-2.1 2.6h2.2M6.5 4.5h7M6.5 8h7M6.5 11.5h7"/>',
+  tasks: '<rect x="2.3" y="3" width="3.2" height="3.2" rx=".6"/><rect x="2.3" y="9.8" width="3.2" height="3.2" rx=".6"/><path d="M7 4.6h6.5M7 11.4h6.5"/>',
+  quote: '<path d="M3 4h4v4.5L5 12M9 4h4v4.5L11 12"/>',
+  rule: '<path d="M2 8h12"/>',
+  table: '<rect x="2.5" y="3" width="11" height="10" rx="1"/><path d="M2.5 6.5h11M2.5 10h11M8 3v10"/>',
+  undo: '<path d="M5.5 3L2.5 6l3 3"/><path d="M2.5 6h7a4 4 0 0 1 0 8H7"/>',
+  redo: '<path d="M10.5 3l3 3-3 3"/><path d="M13.5 6h-7a4 4 0 0 0 0 8H9"/>',
+  sortup: '<path d="M8 13V3M4.5 6.5L8 3l3.5 3.5"/>',
+  sortdown: '<path d="M8 3v10M4.5 9.5L8 13l3.5-3.5"/>',
+  rowabove: '<rect x="2.5" y="8" width="11" height="5" rx=".8"/><path d="M8 2v4M6 4h4"/>',
+  rowbelow: '<rect x="2.5" y="3" width="11" height="5" rx=".8"/><path d="M8 10v4M6 12h4"/>',
+  colleft: '<rect x="8" y="2.5" width="5" height="11" rx=".8"/><path d="M2 8h4M4 6v4"/>',
+  colright: '<rect x="3" y="2.5" width="5" height="11" rx=".8"/><path d="M10 8h4M12 6v4"/>',
+  sum: '<path d="M12 3H4l4.5 5L4 13h8"/>',
+  layout: '<rect x="2" y="3" width="12" height="10" rx="1"/><path d="M2 6.5h12M7.5 6.5V13"/>',
+  theme: '<circle cx="8" cy="8" r="5.5"/><path d="M8 2.5v11a5.5 5.5 0 0 0 0-11z" fill="currentColor"/>',
+  notes: '<path d="M3 3h10M3 6.5h10M3 10h6"/>',
+  outline: '<path d="M3 3.5h10M5 7h8M5 10.5h8M3 7h.01M3 10.5h.01"/>',
+};
+const APP_ICON = {
+  doc: ["doc", "sky"], note: ["note", "kraft"], list: ["list", "ink"], table: ["sheet", "olive"], sheet: ["sheet", "olive"], data: ["data", "gray"], link: ["link", "gray"], page: ["page", "ink"], program: ["program", "ink"], app: ["app", "clay"],
+  slides: ["slides", "clay"], canvas: ["canvas", "kraft"], site: ["site", "ink"], board: ["board", "olive"], records: ["records", "sky"], quiz: ["quiz", "clay"], poll: ["poll", "kraft"], form: ["form", "ink"], chart: ["chart", "sky"], timeline: ["timeline", "olive"], cards: ["cards", "kraft"],
+};
+/* an icon as an element: icon("search"), icon("doc", 20) */
+function svgIcon(name, size) {
+  const s = size || 16, ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16"); svg.setAttribute("width", s); svg.setAttribute("height", s); svg.setAttribute("aria-hidden", "true"); svg.setAttribute("class", "ic");
+  svg.innerHTML = ICONS[name] || ICONS.app; return svg;
+}
+/* the tile of a kind of file: a coloured square with its glyph (like an app's icon) */
+const iconKind = f => f && f.kit && APP_ICON[f.kit] ? f.kit : f && f.type ? f.type : String(f || "app");
+function appTile(kind, size) { const [g, c] = APP_ICON[kind] || APP_ICON.app, s = size || 16; const t = el("i", { class: "tile tone-" + c, "aria-hidden": "true" }, svgIcon(g, Math.round(s * 0.66))); t.style.setProperty("--ts", s + "px"); return t; }
+/* an icon button with a tooltip: ibtn("delete", "Delete", fn) */
+const ibtn = (name, label, fn, cls) => el("button", { type: "button", class: "ibtn" + (cls ? " " + cls : ""), "aria-label": label, "data-tip": label, onclick: ev => { ev.stopPropagation(); fn(ev); } }, svgIcon(name));
+const clone = v => v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+const KIND_LABEL = { note: "Note", idea: "Idea", question: "Question", decision: "Decision", task: "Task", quote: "Quote", source: "Source" };
+const TYPE_LABEL = { note: "Note", doc: "Document", list: "Checklist", table: "Spreadsheet", data: "Data", link: "Link", page: "Page", program: "Program", app: "App" };
+const WHO = { you: "You", claude: "Claude · chat", agent: "Claude · canvas" };
+const hhmm = ts => { const d = new Date(ts); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
+const fmtNum = (v, d) => typeof v === "number" && isFinite(v) ? v.toLocaleString("en-US", d != null ? { minimumFractionDigits: d, maximumFractionDigits: d } : { maximumFractionDigits: 2 }) : v == null ? "—" : String(v);
+/* people never need to see code: programs, sources and JSON show only with developer mode on (Settings) */
+const devMode = () => { try { return localStorage.getItem("cc.dev") === "1"; } catch (e) { return false; } };
+const typingIn = node => { const a = document.activeElement; return !!(node && a && node.contains(a) && a.matches("textarea, input, select, [contenteditable], [contenteditable] *")); };
+const focusedIn = node => !!(node && document.activeElement && node.contains(document.activeElement) && document.activeElement !== document.body);
+const DEFAULT_SIZE = { doc: [560, 620], list: [300, 280], table: [620, 380], data: [320, 220], link: [280, 96], page: [480, 360], program: [520, 420], app: [560, 440] };
+
+/* ==========================================================================
+   EDITOR · a transparent <textarea> over a highlighted <pre>, with a gutter
+   and line bands. One instance per app's code view. No libraries.
+   ========================================================================== */
+const KW = new Set(["const", "let", "var", "function", "return", "if", "else", "for", "while", "of", "in", "new", "true", "false", "null", "undefined", "typeof", "this"]);
+const escH = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function highlight(src) {
+  const DSLW = new Set(T.DSL_NAMES); let out = "", i = 0, m;
+  const re = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?|`(?:\\.|[^`\\])*`?)|(\b\d+(?:\.\d+)?(?:e\d+)?\b)|(\.[a-z]\w*)(?=\s*\()|([A-Za-z_$][\w$]*)|(=>|[{}()[\],;.+\-*/<>=!?:&|%])/g;
+  while ((m = re.exec(src))) {
+    if (m.index > i) out += escH(src.slice(i, m.index));
+    const [t, com, str, num, meth, id, op] = m;
+    if (com) out += `<span class="t-com">${escH(t)}</span>`; else if (str) out += `<span class="t-str">${escH(t)}</span>`; else if (num) out += `<span class="t-num">${t}</span>`;
+    else if (meth) out += `<span class="t-mod">${escH(t)}</span>`; else if (id) out += KW.has(id) ? `<span class="t-kw">${id}</span>` : DSLW.has(id) && src[re.lastIndex] === "(" ? `<span class="t-fn">${id}</span>` : escH(id);
+    else if (op) out += `<span class="t-op">${escH(t)}</span>`; else out += escH(t);
+    i = re.lastIndex;
+  }
+  if (i < src.length) out += escH(src.slice(i));
+  return out + "\n";
+}
+class Editor {
+  constructor(o) {
+    this.o = o;
+    this.ta = el("textarea", { class: "code-ta", spellcheck: "false", autocapitalize: "off", autocomplete: "off", wrap: "off", "aria-label": "App program source" });
+    this.pre = el("pre", { class: "code-hl", "aria-hidden": "true" }); this.bands = el("div", { class: "code-bands", "aria-hidden": "true" }); this.gutter = el("div", { class: "code-gutter-in" });
+    this.el = el("div", { class: "code-ed" }, el("div", { class: "code-gutter", "aria-hidden": "true" }, this.gutter), el("div", { class: "code-box" }, this.bands, this.pre, this.ta));
+    this.marks = { err: new Set(), sel: null, stream: null };
+    this.ta.addEventListener("input", () => { this.render(); o.onChange(this.ta.value); });
+    this.ta.addEventListener("scroll", () => this.sync());
+    this.ta.addEventListener("keydown", e => this.key(e));
+  }
+  get value() { return this.ta.value; }
+  set(code) { if (this.ta.value !== code) { this.ta.value = code; this.render(); } }
+  render() {
+    this.pre.innerHTML = highlight(this.ta.value);
+    const n = this.ta.value.split("\n").length;
+    if (this.gutter.childElementCount !== n) { const f = document.createDocumentFragment(); for (let i = 1; i <= n; i++) f.appendChild(el("div", null, String(i))); this.gutter.replaceChildren(f); }
+    this.paint(); this.sync();
+  }
+  sync() { const y = this.ta.scrollTop, x = this.ta.scrollLeft; this.pre.style.transform = `translate(${-x}px, ${-y}px)`; this.gutter.style.transform = `translateY(${-y}px)`; this.bands.style.transform = `translateY(${-y}px)`; }
+  mark(err) { this.marks.err = new Set(err.filter(l => l != null)); this.paint(); }
+  stream(line) { this.marks.stream = line; this.paint(); if (line) this.reveal(line); }
+  reveal(line) { const y = (line - 1) * 20, h = this.ta.clientHeight || 200; if (y < this.ta.scrollTop + 20 || y > this.ta.scrollTop + h - 40) this.ta.scrollTop = Math.max(0, y - h / 3); this.sync(); }
+  paint() {
+    const kids = this.gutter.children;
+    for (let i = 0; i < kids.length; i++) kids[i].className = this.marks.err.has(i + 1) ? "err" : (i + 1) === this.marks.sel ? "sel" : "";
+    const f = document.createDocumentFragment(), band = (l, c) => { const d = el("div", { class: "band " + c }); d.style.top = (l - 1) * 20 + "px"; f.appendChild(d); };
+    this.marks.err.forEach(l => band(l, "err")); if (this.marks.sel) band(this.marks.sel, "sel"); if (this.marks.stream) band(this.marks.stream, "stream");
+    this.bands.replaceChildren(f);
+  }
+  goto(line) {
+    const lines = this.ta.value.split("\n"); let pos = 0;
+    for (let i = 0; i < line - 1 && i < lines.length; i++) pos += lines[i].length + 1;
+    this.ta.focus({ preventScroll: true }); this.ta.selectionStart = this.ta.selectionEnd = pos + (lines[line - 1] || "").search(/\S|$/);
+    this.marks.sel = line; this.paint(); this.reveal(line);
+  }
+  key(e) {
+    e.stopPropagation();
+    const ta = this.ta, v = ta.value, s = ta.selectionStart, en = ta.selectionEnd;
+    if ((e.metaKey || e.ctrlKey) && (e.key === "Enter" || e.key === "s")) { e.preventDefault(); this.o.onRun(); return; }
+    if (e.key === "Tab") {
+      e.preventDefault(); const ls = v.lastIndexOf("\n", s - 1) + 1;
+      if (s === en && !e.shiftKey) { this.insert("  "); return; }
+      const le = v.indexOf("\n", en - (en > s && v[en - 1] === "\n" ? 1 : 0)), end = le < 0 ? v.length : le;
+      const nb = v.slice(ls, end).split("\n").map(l => e.shiftKey ? l.replace(/^ {1,2}/, "") : "  " + l).join("\n");
+      ta.setRangeText(nb, ls, end, "preserve"); ta.selectionStart = ls; ta.selectionEnd = ls + nb.length; this.render(); this.o.onChange(ta.value); return;
+    }
+    if (e.key === "Enter" && !e.isComposing) {
+      e.preventDefault(); const ls = v.lastIndexOf("\n", s - 1) + 1, line = v.slice(ls, s);
+      let ind = (line.match(/^\s*/) || [""])[0]; if (/[([{]\s*$/.test(line) || /=>\s*$/.test(line)) ind += "  ";
+      if (/[)\]}]/.test(v[s] || "") && /[([{]\s*$/.test(line)) { this.insert("\n" + ind + "\n" + ind.slice(2), ind.length + 1); return; }
+      this.insert("\n" + ind); return;
+    }
+    const pairs = { "(": ")", "[": "]", "{": "}", '"': '"', "`": "`" };
+    if (pairs[e.key] && s === en && !e.metaKey && !e.ctrlKey) {
+      const nx = v[s] || "";
+      if ((e.key === '"' || e.key === "`") && nx === e.key) { e.preventDefault(); ta.selectionStart = ta.selectionEnd = s + 1; return; }
+      if (!nx || /[\s)\]},;]/.test(nx)) { e.preventDefault(); this.insert(e.key + pairs[e.key], 1); return; }
+    }
+    if (/^[)\]}]$/.test(e.key) && v[s] === e.key && s === en) { e.preventDefault(); ta.selectionStart = ta.selectionEnd = s + 1; return; }
+    if (e.key === "Backspace" && s === en && s > 0 && pairs[v[s - 1]] === v[s]) { e.preventDefault(); ta.setRangeText("", s - 1, s + 1, "end"); this.render(); this.o.onChange(ta.value); }
+  }
+  insert(text, off) { const ta = this.ta, s = ta.selectionStart; ta.setRangeText(text, s, ta.selectionEnd, "end"); if (off != null) ta.selectionStart = ta.selectionEnd = s + off; this.render(); this.o.onChange(ta.value); }
+}
+
+/* ==========================================================================
+   FILE EDITORS · one per type, shared by desktop objects and app parts.
+   Each returns { el, set(value) }; it calls commit(newValue) on change and
+   never redraws under a focused cursor.
+   ========================================================================== */
+/* ==========================================================================
+   RICH TEXT · documents and slides are edited as formatted text, like a word
+   processor, and saved as markdown, which is what Claude reads and writes.
+   richText(md, onChange, opts) is the editable surface; docEditor() wraps it
+   with a toolbar, an outline and a status bar. Markdown shortcuts work while
+   typing: # ## ### for headings, - or * for bullets, 1. for numbers, [] for a
+   checklist, > for a quote, --- then Enter for a rule.
+   ========================================================================== */
+const mdOfInline = node => {
+  let out = "";
+  for (const n of node.childNodes) {
+    if (n.nodeType === 3) { out += n.nodeValue.replace(/ /g, " "); continue; }
+    if (n.nodeType !== 1) continue;
+    const t = n.tagName, inner = () => mdOfInline(n);
+    if (t === "BR") out += " ";
+    else if (t === "STRONG" || t === "B") { const v = inner(); out += v.trim() ? `**${v.trim()}**` + (/\s$/.test(v) ? " " : "") : v; }
+    else if (t === "EM" || t === "I") { if (n.classList.contains("md-box")) continue; const v = inner(); out += v.trim() ? `*${v.trim()}*` + (/\s$/.test(v) ? " " : "") : v; }
+    else if (t === "S" || t === "DEL" || t === "STRIKE") { const v = inner(); out += v.trim() ? `~~${v.trim()}~~` : v; }
+    else if (t === "CODE") out += "`" + n.textContent + "`";
+    else if (t === "A") { const h = n.getAttribute("href") || ""; out += /^https?:\/\//i.test(h) ? `[${inner()}](${h})` : inner(); }
+    else if (t === "UL" || t === "OL") continue; // nested lists are their own lines
+    else out += inner();
+  }
+  return out;
+};
+function mdOfBlocks(root) {
+  const blocks = [];
+  const list = (n, depth) => {
+    const lines = []; let k = 1;
+    for (const li of n.children) {
+      if (li.tagName !== "LI") continue;
+      const pad = "  ".repeat(depth), task = li.classList.contains("md-task");
+      const mark = n.tagName === "OL" ? `${k++}. ` : task ? `- [${li.classList.contains("on") ? "x" : " "}] ` : "- ";
+      lines.push(pad + mark + mdOfInline(li).replace(/\s+/g, " ").trim());
+      for (const sub of li.children) if (sub.tagName === "UL" || sub.tagName === "OL") lines.push(...list(sub, depth + 1));
+    }
+    return lines;
+  };
+  const visit = n => {
+    if (n.nodeType === 3) { const v = n.nodeValue.trim(); if (v) blocks.push(v); return; }
+    if (n.nodeType !== 1) return;
+    const t = n.tagName;
+    if (/^H[1-6]$/.test(t)) { const v = mdOfInline(n).trim(); if (v) blocks.push("#".repeat(Math.min(4, +t[1])) + " " + v); return; }
+    if (t === "UL" || t === "OL") { const l = list(n, 0); if (l.length) blocks.push(l.join("\n")); return; }
+    if (t === "BLOCKQUOTE") { const v = [...n.childNodes].some(c => c.nodeType === 1 && /^(P|DIV)$/.test(c.tagName)) ? [...n.children].map(c => mdOfInline(c).trim()).filter(Boolean) : [mdOfInline(n).trim()]; if (v.join("")) blocks.push(v.map(x => "> " + x).join("\n>\n")); return; }
+    if (t === "PRE") { blocks.push("```\n" + n.textContent.replace(/\n$/, "") + "\n```"); return; }
+    if (t === "HR") { blocks.push("---"); return; }
+    if (t === "TABLE" || (t === "DIV" && n.classList.contains("md-table"))) {
+      const tb = t === "TABLE" ? n : n.querySelector("table"); if (!tb) return;
+      const rows = [...tb.querySelectorAll("tr")].map(r => [...r.children].map(c => mdOfInline(c).trim().replace(/\|/g, "\\|")));
+      if (rows.length) blocks.push([rows[0], rows[0].map(() => "---")].concat(rows.slice(1)).map(r => "| " + r.join(" | ") + " |").join("\n"));
+      return;
+    }
+    // the browser sometimes puts lists inside paragraphs while editing: read the pieces in order
+    const isBlock = c => c.nodeType === 1 && /^(P|H[1-6]|UL|OL|BLOCKQUOTE|PRE|HR|TABLE|DIV)$/.test(c.tagName);
+    if ((t === "DIV" || t === "P") && [...n.childNodes].some(isBlock)) {
+      let buf = document.createElement("span"); const flushBuf = () => { const v = mdOfInline(buf).trim(); if (v) blocks.push(v); buf = document.createElement("span"); };
+      for (const c of [...n.childNodes]) { if (isBlock(c)) { flushBuf(); visit(c); } else buf.append(c.cloneNode(true)); }
+      flushBuf(); return;
+    }
+    const v = mdOfInline(n).replace(/[ \t]+\n/g, "\n").trim(); if (v) blocks.push(v);
+  };
+  root.childNodes.forEach(visit);
+  return blocks.join("\n\n");
+}
+/* a caret as a character offset in an element's text, and back: it survives a redraw of the element */
+function caretOffset(root) { const s = getSelection(); if (!s.rangeCount || !root.contains(s.anchorNode)) return null; const r = document.createRange(); r.selectNodeContents(root); try { r.setEnd(s.anchorNode, s.anchorOffset); } catch (e) { return null; } return r.toString().length; }
+function setCaretOffset(root, n) {
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT), s = getSelection(), r = document.createRange(); let t, left = Math.max(0, n);
+  while ((t = w.nextNode())) { if (left <= t.length) { r.setStart(t, left); r.collapse(true); s.removeAllRanges(); s.addRange(r); return; } left -= t.length; }
+  r.selectNodeContents(root); r.collapse(false); s.removeAllRanges(); s.addRange(r);
+}
+/* the editable surface */
+function richText(md, onChange, opts) {
+  opts = opts || {};
+  const body = el("div", { class: "rt-body md" + (opts.cls ? " " + opts.cls : ""), contenteditable: opts.readonly ? "false" : "true", spellcheck: "true", role: "textbox", "aria-multiline": "true", "aria-label": opts.label || "Document", "data-placeholder": opts.placeholder || "Start writing…" });
+  let last = String(md ?? ""), t = null, pendingV = null, idleT = null, typedAt = 0;
+  const fill = v => { body.replaceChildren(...mdRender(v).childNodes); body.querySelectorAll("i.md-box").forEach(x => x.remove()); empty(); };
+  const empty = () => body.classList.toggle("is-empty", !body.textContent.trim() && !body.querySelector("hr, li, table"));
+  const read = () => mdOfBlocks(body);
+  // the change says what it was made from (last), so the store can merge it with what others wrote meanwhile
+  const save = () => { clearTimeout(t); const v = read(); empty(); if (v !== last) { const from = last; last = v; onChange(v, from); } };
+  /* someone else changed this document while you were in it: when you pause, their change is folded in
+     around your own (unsaved words included) and your caret stays where it was */
+  const applyPending = () => {
+    idleT = null; if (pendingV === null) return;
+    if (document.activeElement !== body) { const v = pendingV; pendingV = null; if (v !== last) { last = v; fill(v); } return; }
+    if (Date.now() - typedAt < 1200) { idleT = setTimeout(applyPending, 400); return; }
+    const v = pendingV; pendingV = null; const cur = read();
+    if (cur === v) { last = v; return; }
+    const merged = T.merge3(last, cur, v), before = body.textContent, at = caretOffset(body);
+    last = v;
+    if (merged !== cur) { fill(merged); if (at != null) { const after = body.textContent; let p = 0; while (p < before.length && p < after.length && before[p] === after[p]) p++; setCaretOffset(body, at > p ? Math.max(p, at + after.length - before.length) : at); } }
+    if (merged !== v) { clearTimeout(t); t = setTimeout(save, 200); }
+  };
+  fill(last);
+  try { document.execCommand("defaultParagraphSeparator", false, "p"); } catch (e) {}
+  body.addEventListener("input", e => { typedAt = Date.now(); empty(); clearTimeout(t); t = setTimeout(save, 450); if (opts.onInput) opts.onInput(); shortcuts(e); });
+  body.addEventListener("blur", () => { save(); if (pendingV !== null) setTimeout(applyPending, 0); });
+  body.addEventListener("pointerdown", e => e.stopPropagation());
+  // a checklist item ticks when its box (left of the text) is clicked
+  body.addEventListener("click", e => { const li = e.target.closest("li.md-task"); if (!li) return; const r = li.getBoundingClientRect(); if (e.clientX < r.left + 4) { li.classList.toggle("on"); save(); } });
+  body.addEventListener("keydown", e => {
+    e.stopPropagation();
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && e.key.toLowerCase() === "b") { e.preventDefault(); document.execCommand("bold"); }
+    else if (mod && e.key.toLowerCase() === "i") { e.preventDefault(); document.execCommand("italic"); }
+    else if (mod && e.shiftKey && e.key.toLowerCase() === "x") { e.preventDefault(); document.execCommand("strikeThrough"); }
+    else if (e.key === "Enter" && !e.shiftKey) {
+      const b = blockAt(); if (b && /^(P|DIV)$/.test(b.tagName) && /^(-{3,}|\*{3,})$/.test(b.textContent.trim())) { e.preventDefault(); const hr = el("hr"), p = el("p", null, el("br")); b.replaceWith(hr); hr.after(p); caretIn(p); save(); }
+      // Enter on an empty checklist item ends the list, like the other lists
+    }
+    else if (e.key === "Tab" && blockAt() && blockAt().tagName === "LI") { e.preventDefault(); document.execCommand(e.shiftKey ? "outdent" : "indent"); }
+    else if (e.key === "Escape") body.blur();
+  });
+  // pasting rich text keeps only what markdown can hold
+  body.addEventListener("paste", e => {
+    const txt = e.clipboardData && e.clipboardData.getData("text/plain"); if (!txt) return;
+    e.preventDefault();
+    if (/\n/.test(txt) && /(^|\n)(#{1,4} |[-*] |\d+\. |> |\|)/.test(txt)) { const frag = mdRender(txt); frag.querySelectorAll("i.md-box").forEach(x => x.remove()); document.execCommand("insertHTML", false, frag.innerHTML); }
+    else document.execCommand("insertText", false, txt);
+  });
+  const blockAt = () => { const s = getSelection(); if (!s.rangeCount) return null; let n = s.anchorNode; while (n && n !== body && !(n.nodeType === 1 && /^(P|DIV|H[1-6]|LI|BLOCKQUOTE|PRE)$/.test(n.tagName))) n = n.parentNode; return n && n !== body ? n : null; };
+  const caretIn = n => { const r = document.createRange(); r.selectNodeContents(n); r.collapse(true); const s = getSelection(); s.removeAllRanges(); s.addRange(r); };
+  /* markdown shortcuts at the start of a line, the moment the space is typed */
+  function shortcuts(e) {
+    if (e.inputType !== "insertText" || e.data !== " ") return;
+    const b = blockAt(); if (!b || !/^(P|DIV|H[1-6])$/.test(b.tagName)) return;
+    const s = getSelection(), r = s.getRangeAt(0), pre = document.createRange(); pre.setStart(b, 0); pre.setEnd(r.endContainer, r.endOffset);
+    const head = pre.toString().replace(/ /g, " "), m = /^(#{1,3}|[-*]|1[.)]|\[ ?\]|>) $/.exec(head); if (!m) return;
+    s.removeAllRanges(); s.addRange(pre); document.execCommand("delete");
+    const k = m[1];
+    if (k[0] === "#") document.execCommand("formatBlock", false, "h" + k.length);
+    else if (k === ">") document.execCommand("formatBlock", false, "blockquote");
+    else if (/^1/.test(k)) document.execCommand("insertOrderedList");
+    else { document.execCommand("insertUnorderedList"); if (k[0] === "[") { const li = blockAt(); if (li && li.tagName === "LI") li.classList.add("md-task"); } }
+  }
+  return {
+    el: body, read, save, focus: () => body.focus(),
+    set(v) {
+      const sv = String(v ?? ""); if (sv === last) { pendingV = null; return true; }
+      if (document.activeElement === body) { pendingV = sv; if (!idleT) idleT = setTimeout(applyPending, 600); return false; }
+      last = sv; fill(sv); return true;
+    },
+    exec(cmd, arg) {
+      body.focus();
+      if (cmd === "block") { const b = blockAt(); if (b && b.tagName === "LI") document.execCommand(b.parentNode.tagName === "OL" ? "insertOrderedList" : "insertUnorderedList"); document.execCommand("formatBlock", false, arg); }
+      else if (cmd === "tasks") { const b = blockAt(); if (!b || b.tagName !== "LI") document.execCommand("insertUnorderedList"); const li = blockAt(); if (li && li.tagName === "LI") li.classList.toggle("md-task"); }
+      else if (cmd === "rule") document.execCommand("insertHTML", false, "<hr><p><br></p>");
+      else if (cmd === "table") document.execCommand("insertHTML", false, '<div class="md-table"><table><thead><tr><th>Column</th><th>Column</th></tr></thead><tbody><tr><td> </td><td> </td></tr><tr><td> </td><td> </td></tr></tbody></table></div><p><br></p>');
+      else if (cmd === "code") { const s = getSelection(); if (s.rangeCount && !s.isCollapsed) document.execCommand("insertHTML", false, "<code>" + mdEsc(s.toString()) + "</code>"); else document.execCommand("formatBlock", false, "pre"); }
+      else if (cmd === "link") { if (arg) document.execCommand("createLink", false, arg); }
+      else document.execCommand(cmd, false, arg || null);
+      setTimeout(save, 0);
+    },
+    block: () => { const b = blockAt(); return b ? (b.tagName === "LI" ? (b.classList.contains("md-task") ? "tasks" : b.parentNode.tagName === "OL" ? "numbers" : "bullets") : b.tagName.toLowerCase()) : "p"; },
+  };
+}
+/* a word processor: toolbar, page, outline, status */
+function docEditor(value, commit, opts) {
+  opts = opts || {};
+  const words = el("span"), state = el("span", { class: "rt-state" }), outline = el("nav", { class: "rt-outline", "aria-label": "Outline" });
+  const rt = richText(value, (v, from) => { commit(v, from); state.textContent = "Saved"; }, { placeholder: opts.placeholder || "Start writing. # for a heading, - for a list, [] for a checklist.", label: opts.label, onInput: () => { state.textContent = "Editing…"; count(); clearTimeout(ot); ot = setTimeout(drawOutline, 300); syncBar(); } });
+  let ot = null;
+  const count = () => { const n = ((rt.el.innerText || rt.el.textContent).match(/\S+/g) || []).length; words.textContent = `${n} word${n === 1 ? "" : "s"}${n > 120 ? ` · ${Math.max(1, Math.round(n / 230))} min read` : ""}`; };
+  const drawOutline = () => { const hs = [...rt.el.querySelectorAll("h1, h2, h3")]; outline.classList.toggle("has", hs.length >= 2); outline.replaceChildren(el("div", { class: "ke-label" }, "Outline"), ...hs.map(h => el("button", { type: "button", class: "lv" + h.tagName[1], onclick: ev => { ev.stopPropagation(); h.scrollIntoView({ block: "start", behavior: "smooth" }); } }, h.textContent || "Untitled"))); };
+  const style = el("select", { class: "rt-style", "aria-label": "Text style", onpointerdown: e => e.stopPropagation(), onchange: () => { rt.exec("block", style.value); style.blur(); } }, ...[["p", "Text"], ["h1", "Title"], ["h2", "Heading"], ["h3", "Subheading"], ["blockquote", "Quote"], ["pre", "Code block"]].map(([v, l]) => el("option", { value: v }, l)));
+  const tb = (icon, label, fn) => { const b = ibtn(icon, label, fn); b.addEventListener("mousedown", e => e.preventDefault()); return b; }; // keep the text selection
+  const linkIn = el("input", { type: "url", class: "rt-link", placeholder: "https://…", "aria-label": "Link address", hidden: true });
+  let saved = null;
+  linkIn.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); const u = linkIn.value.trim(); linkIn.hidden = true; const s = getSelection(); if (saved) { s.removeAllRanges(); s.addRange(saved); } if (u) rt.exec("link", /^[a-z]+:/i.test(u) ? u : "https://" + u); } if (e.key === "Escape") { linkIn.hidden = true; rt.focus(); } });
+  const bar = el("div", { class: "rt-bar tb", role: "toolbar", "aria-label": "Formatting" }, style, el("span", { class: "kv-sep" }),
+    tb("bold", "Bold · ⌘B", () => rt.exec("bold")), tb("italic", "Italic · ⌘I", () => rt.exec("italic")), tb("strike", "Strikethrough", () => rt.exec("strikeThrough")), tb("code", "Code", () => rt.exec("code")),
+    tb("link", "Link", () => { const s = getSelection(); saved = s.rangeCount ? s.getRangeAt(0).cloneRange() : null; linkIn.hidden = false; linkIn.value = ""; linkIn.focus(); }), linkIn, el("span", { class: "kv-sep" }),
+    tb("bullets", "Bulleted list", () => rt.exec("insertUnorderedList")), tb("numbers", "Numbered list", () => rt.exec("insertOrderedList")), tb("tasks", "Checklist", () => rt.exec("tasks")), tb("quote", "Quote", () => rt.exec("block", "blockquote")),
+    el("span", { class: "kv-sep" }), tb("rule", "Divider", () => rt.exec("rule")), tb("table", "Table", () => rt.exec("table")), el("span", { class: "grow" }),
+    tb("undo", "Undo · ⌘Z", () => rt.exec("undo")), tb("redo", "Redo · ⌘⇧Z", () => rt.exec("redo")));
+  const syncBar = () => { const b = rt.block(); style.value = ["h1", "h2", "h3", "blockquote", "pre"].includes(b) ? b : "p"; };
+  const page = el("div", { class: "rt-page" }, rt.el);
+  page.addEventListener("click", e => { if (e.target === page) rt.focus(); });
+  const wrap = el("div", { class: "rt" }, bar, el("div", { class: "rt-main" }, outline, el("div", { class: "rt-scroll" }, page)), el("div", { class: "rt-status" }, words, el("span", { class: "grow" }), state));
+  const onSel = () => { if (!wrap.isConnected && wrap.dataset.mounted) { document.removeEventListener("selectionchange", onSel); return; } if (document.activeElement === rt.el) { wrap.dataset.mounted = "1"; syncBar(); } };
+  document.addEventListener("selectionchange", onSel);
+  count(); drawOutline();
+  return { el: wrap, set(v) { const ok = rt.set(v); if (ok) { count(); drawOutline(); } return ok; } };
+}
+
+/* ==========================================================================
+   SPREADSHEET · a grid you drive like any spreadsheet: click or arrow to a
+   cell and type, Enter or F2 or a double-click to edit what is there, Tab
+   and Enter move on, Shift extends a selection, Delete clears it, ⌘C and ⌘V
+   copy and paste blocks (from other spreadsheets too). The formula bar shows
+   what is really in the cell; the status bar adds up what is selected. Row 0
+   is the header (the column names); A1 is the first cell under it.
+   Content stays { cols, rows } plus optional formats per column, so Claude
+   reads and writes it as a pipe table.
+   ========================================================================== */
+const SHEET_FORMATS = [["", "Auto"], ["number", "1,234.56"], ["whole", "1,235"], ["money", "Money 1,234.00"], ["percent", "Percent 12%"], ["text", "Text"]];
+function fmtAs(v, f) {
+  if (typeof v !== "number" || !f || f === "text") return fmtCell(v);
+  if (f === "number") return v.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  if (f === "whole") return Math.round(v).toLocaleString("en-US");
+  if (f === "money") return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (f === "percent") return (v * 100).toLocaleString("en-US", { maximumFractionDigits: 1 }) + "%";
+  return fmtCell(v);
+}
+function sheetEditor(value, commit) {
+  const norm = v => { const o = v && typeof v === "object" && !Array.isArray(v) ? v : { cols: ["A", "B"], rows: [["", ""]] }; const cols = (o.cols || []).map(String); return { cols: cols.length ? cols : ["A"], rows: (o.rows || []).map(r => cols.map((_, j) => { const x = [].concat(r)[j]; return x == null ? "" : x; })), formats: Array.isArray(o.formats) ? o.formats.slice(0, cols.length) : [] }; };
+  let tv = norm(value), act = { r: 0, c: 0 }, anchor = { r: 0, c: 0 }, editing = null;
+  if (!tv.rows.length) tv.rows.push(tv.cols.map(() => ""));
+  const isF = v => typeof v === "string" && v[0] === "=";
+  const num = v => (/^-?\d+(\.\d+)?$/.test(String(v).trim()) ? Number(v) : v);
+  const save = () => { while (tv.rows.length > 1 && tv.rows[tv.rows.length - 1].every(x => x === "")) tv.rows.pop(); const out = { cols: tv.cols.slice(), rows: tv.rows.map(r => r.slice()) }; if (tv.formats.some(Boolean)) out.formats = tv.formats.slice(); commit(clone(out)); };
+  const raw = (r, c) => r < 0 ? tv.cols[c] : (tv.rows[r] || [])[c] ?? "";
+  const setRaw = (r, c, v) => { if (r < 0) { tv.cols[c] = String(v).trim() || colName(c); return; } while (tv.rows.length <= r) tv.rows.push(tv.cols.map(() => "")); while (tv.cols.length <= c) { tv.cols.push(colName(tv.cols.length)); tv.rows.forEach(x => x.push("")); } tv.rows[r][c] = isF(String(v).trim()) ? String(v).trim() : num(v); };
+  const ref = (r, c) => r < 0 ? colName(c) + " name" : colName(c) + (r + 1);
+  const rng = () => ({ r0: Math.min(act.r, anchor.r), r1: Math.max(act.r, anchor.r), c0: Math.min(act.c, anchor.c), c1: Math.max(act.c, anchor.c) });
+
+  const refBox = el("span", { class: "sg-ref" }), fx = el("input", { class: "sg-fx", type: "text", spellcheck: "false", "aria-label": "Cell contents" });
+  const fmtSel = el("select", { class: "sg-fmt", "aria-label": "Number format", onpointerdown: e => e.stopPropagation() }, ...SHEET_FORMATS.map(([v, l]) => el("option", { value: v }, l)));
+  const tb = (icon, label, fn) => ibtn(icon, label, () => { fn(); draw(); save(); grid.focus({ preventScroll: true }); });
+  const bar = el("div", { class: "sg-bar tb", role: "toolbar", "aria-label": "Spreadsheet" },
+    tb("rowabove", "Insert row above", () => { tv.rows.splice(Math.max(0, act.r), 0, tv.cols.map(() => "")); }),
+    tb("rowbelow", "Insert row below", () => { tv.rows.splice(act.r + 1, 0, tv.cols.map(() => "")); act.r++; anchor = Object.assign({}, act); }),
+    tb("colleft", "Insert column left", () => { tv.cols.splice(act.c, 0, colName(tv.cols.length)); tv.rows.forEach(r => r.splice(act.c, 0, "")); tv.formats.splice(act.c, 0, ""); }),
+    tb("colright", "Insert column right", () => { tv.cols.splice(act.c + 1, 0, colName(tv.cols.length)); tv.rows.forEach(r => r.splice(act.c + 1, 0, "")); tv.formats.splice(act.c + 1, 0, ""); act.c++; anchor = Object.assign({}, act); }),
+    el("span", { class: "kv-sep" }),
+    tb("sortup", "Sort A → Z by this column", () => sortBy(1)), tb("sortdown", "Sort Z → A by this column", () => sortBy(-1)),
+    tb("sum", "Sum the numbers above", () => { if (act.r < 1) return; let top = act.r - 1; while (top > 0 && typeof evalAt(top - 1, act.c) === "number") top--; setRaw(act.r, act.c, `=SUM(${colName(act.c)}${top + 1}:${colName(act.c)}${act.r})`); }),
+    fmtSel, el("span", { class: "grow" }),
+    tb("delete", "Delete selected rows", () => { const g = rng(); if (g.r0 < 0) return; tv.rows.splice(g.r0, g.r1 - g.r0 + 1); if (!tv.rows.length) tv.rows.push(tv.cols.map(() => "")); act.r = anchor.r = Math.min(g.r0, tv.rows.length - 1); }));
+  const delCol = ibtn("close", "Delete selected columns", () => { const g = rng(); if (tv.cols.length - (g.c1 - g.c0 + 1) < 1) return; tv.cols.splice(g.c0, g.c1 - g.c0 + 1); tv.rows.forEach(r => r.splice(g.c0, g.c1 - g.c0 + 1)); tv.formats.splice(g.c0, g.c1 - g.c0 + 1); act.c = anchor.c = Math.min(g.c0, tv.cols.length - 1); draw(); save(); });
+  bar.append(delCol);
+  fmtSel.addEventListener("change", () => { const g = rng(); for (let c = g.c0; c <= g.c1; c++) tv.formats[c] = fmtSel.value; draw(); save(); grid.focus({ preventScroll: true }); });
+  const fxRow = el("div", { class: "sg-fxrow" }, refBox, el("span", { class: "sg-fxi" }, svgIcon("sum", 13)), fx);
+  const grid = el("div", { class: "sg-grid", tabindex: "0", role: "grid", "aria-label": "Cells" }), scroll = el("div", { class: "sg-scroll" }, grid), status = el("div", { class: "sg-status" });
+  let evalAt = () => "";
+  function sortBy(dir) { const c = act.c; tv.rows.sort((a, b) => { const x = a[c], y = b[c], nx = Number(x), ny = Number(y); if (x === "" && y !== "") return 1; if (y === "" && x !== "") return -1; return (!isNaN(nx) && !isNaN(ny) && x !== "" && y !== "" ? nx - ny : String(x).localeCompare(String(y))) * dir; }); }
+
+  function draw() {
+    const ev = sheetEval(tv.rows); evalAt = (r, c) => isF(raw(r, c)) ? ev(r, c) : raw(r, c);
+    const g = rng(), t = el("table");
+    const head = el("tr", { class: "sg-letters" }, el("th", { class: "sg-corner" }), ...tv.cols.map((_, c) => el("th", { "data-col": String(c), class: c >= g.c0 && c <= g.c1 ? "on" : null }, colName(c))));
+    const names = el("tr", { class: "sg-names" }, el("th", { class: "sg-rn" }), ...tv.cols.map((n, c) => el("th", { "data-r": "-1", "data-c": String(c), class: cellCls(-1, c, g) }, n)));
+    t.append(el("thead", null, head, names));
+    const body = el("tbody");
+    // a few empty rows below the data, ready to type into, like any spreadsheet
+    for (let r = 0; r < shown(); r++) {
+      const tr = el("tr", { class: r >= tv.rows.length ? "ghost" : null }, el("th", { class: "sg-rn" + (r >= g.r0 && r <= g.r1 ? " on" : ""), "data-row": String(r) }, String(r + 1)));
+      tv.cols.forEach((_, c) => { const rv = raw(r, c), v = evalAt(r, c), f = tv.formats[c]; tr.append(el("td", { "data-r": String(r), "data-c": String(c), class: cellCls(r, c, g) + (typeof v === "number" && f !== "text" ? " n" : "") + (isF(rv) ? " fx" : "") + (typeof v === "string" && /^#[A-Z/0]+/.test(v) ? " err" : "") }, fmtAs(v, f))); });
+      body.append(tr);
+    }
+    t.append(body); grid.replaceChildren(t);
+    refBox.textContent = g.r0 === g.r1 && g.c0 === g.c1 ? ref(act.r, act.c) : `${ref(g.r0, g.c0)}:${ref(g.r1, g.c1)}`;
+    if (document.activeElement !== fx) fx.value = String(raw(act.r, act.c));
+    fmtSel.value = tv.formats[act.c] || "";
+    // what is selected, added up
+    const nums = []; for (let r = Math.max(0, g.r0); r <= g.r1; r++) for (let c = g.c0; c <= g.c1; c++) { const v = evalAt(r, c); if (typeof v === "number") nums.push(v); }
+    const cells = (g.r1 - Math.max(0, g.r0) + 1) * (g.c1 - g.c0 + 1);
+    status.replaceChildren(...(nums.length > 1 || cells > 1 ? [el("span", null, `Sum ${fmtCell(Math.round(nums.reduce((a, b) => a + b, 0) * 1e6) / 1e6)}`), el("span", null, `Average ${nums.length ? fmtCell(Math.round(nums.reduce((a, b) => a + b, 0) / nums.length * 100) / 100) : "—"}`), el("span", null, `Count ${nums.length}`)] : [el("span", null, isF(raw(act.r, act.c)) ? `${ref(act.r, act.c)} = ${raw(act.r, act.c)}` : "Type to fill a cell · = starts a formula, like =SUM(B1:B4)")]),
+      el("span", { class: "grow" }), el("span", null, `${tv.rows.length} × ${tv.cols.length}`));
+    const cur = grid.querySelector(`[data-r="${act.r}"][data-c="${act.c}"]`); if (cur && !editing) { const sr = scroll.getBoundingClientRect(), cr = cur.getBoundingClientRect(); if (cr.bottom > sr.bottom) scroll.scrollTop += cr.bottom - sr.bottom + 4; if (cr.top < sr.top + 54) scroll.scrollTop -= sr.top + 54 - cr.top; if (cr.right > sr.right) scroll.scrollLeft += cr.right - sr.right + 4; if (cr.left < sr.left + 40) scroll.scrollLeft -= sr.left + 40 - cr.left; }
+  }
+  const cellCls = (r, c, g) => (r === act.r && c === act.c ? "act " : "") + (r >= g.r0 && r <= g.r1 && c >= g.c0 && c <= g.c1 && !(g.r0 === g.r1 && g.c0 === g.c1) ? "in" : "");
+  const shown = () => Math.max(tv.rows.length + 4, 14);
+  const move = (dr, dc, extend) => { act = { r: Math.max(-1, Math.min(shown() - 1, act.r + dr)), c: Math.max(0, Math.min(tv.cols.length - 1, act.c + dc)) }; if (!extend) anchor = Object.assign({}, act); draw(); };
+  /* editing a cell in place */
+  function edit(initial) {
+    const td = grid.querySelector(`[data-r="${act.r}"][data-c="${act.c}"]`); if (!td) return;
+    const inp = el("input", { class: "sg-in", type: "text", spellcheck: "false", "aria-label": ref(act.r, act.c) });
+    inp.value = initial != null ? initial : String(raw(act.r, act.c));
+    const sr = scroll.getBoundingClientRect(), cr = td.getBoundingClientRect(), z = cr.width / td.offsetWidth || 1;
+    Object.assign(inp.style, { left: (cr.left - sr.left) / z + scroll.scrollLeft + "px", top: (cr.top - sr.top) / z + scroll.scrollTop + "px", width: Math.max(td.offsetWidth, 120) + "px", height: td.offsetHeight + "px" });
+    scroll.append(inp); editing = inp; inp.focus(); if (initial == null) inp.select(); else inp.setSelectionRange(inp.value.length, inp.value.length);
+    const at = Object.assign({}, act);
+    let done = false; const finish = (keep, dr, dc) => { if (done) return; done = true; editing = null; inp.remove(); if (keep && inp.value !== String(raw(at.r, at.c))) { setRaw(at.r, at.c, inp.value); save(); } act = at; anchor = Object.assign({}, at); if (dr || dc) move(dr, dc); else draw(); grid.focus({ preventScroll: true }); };
+    inp.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); finish(true, e.shiftKey ? -1 : 1, 0); } else if (e.key === "Tab") { e.preventDefault(); finish(true, 0, e.shiftKey ? -1 : 1); } else if (e.key === "Escape") { e.preventDefault(); finish(false); } });
+    inp.addEventListener("input", () => { fx.value = inp.value; });
+    inp.addEventListener("blur", () => finish(true));
+  }
+  grid.addEventListener("keydown", e => {
+    if (editing) return;
+    const mod = e.metaKey || e.ctrlKey, k = e.key;
+    const arrows = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
+    if (arrows[k]) { e.preventDefault(); e.stopPropagation(); move(...arrows[k], e.shiftKey); return; }
+    if (k === "Tab") { e.preventDefault(); e.stopPropagation(); move(0, e.shiftKey ? -1 : 1); return; }
+    if (k === "Enter" || k === "F2") { e.preventDefault(); e.stopPropagation(); edit(); return; }
+    if (k === "Delete" || k === "Backspace") { e.preventDefault(); e.stopPropagation(); const g = rng(); for (let r = g.r0; r <= g.r1; r++) for (let c = g.c0; c <= g.c1; c++) if (r >= 0 && tv.rows[r]) tv.rows[r][c] = ""; draw(); save(); return; }
+    if (k === "Escape") { anchor = Object.assign({}, act); draw(); return; }
+    if (mod && k.toLowerCase() === "a") { e.preventDefault(); e.stopPropagation(); anchor = { r: 0, c: 0 }; act = { r: tv.rows.length - 1, c: tv.cols.length - 1 }; draw(); return; }
+    if (!mod && !e.altKey && k.length === 1) { e.preventDefault(); e.stopPropagation(); edit(k); }
+  });
+  /* copy, cut and paste blocks as tab-separated text */
+  const block = () => { const g = rng(), out = []; for (let r = g.r0; r <= g.r1; r++) { const row = []; for (let c = g.c0; c <= g.c1; c++) row.push(String(raw(r, c))); out.push(row.join("\t")); } return out.join("\n"); };
+  grid.addEventListener("copy", e => { if (editing) return; e.preventDefault(); e.clipboardData.setData("text/plain", block()); });
+  grid.addEventListener("cut", e => { if (editing) return; e.preventDefault(); e.clipboardData.setData("text/plain", block()); const g = rng(); for (let r = Math.max(0, g.r0); r <= g.r1; r++) for (let c = g.c0; c <= g.c1; c++) if (tv.rows[r]) tv.rows[r][c] = ""; draw(); save(); });
+  grid.addEventListener("paste", e => {
+    if (editing) return; const t = (e.clipboardData && e.clipboardData.getData("text/plain")) || ""; if (!t) return; e.preventDefault();
+    const lines = t.replace(/\r/g, "").replace(/\n$/, "").split("\n").map(l => l.includes("\t") ? l.split("\t") : /,/.test(l) && !/^=/.test(l) ? l.split(",") : [l]);
+    lines.forEach((cells, dr) => cells.forEach((v, dc) => setRaw(act.r + dr, act.c + dc, v.trim())));
+    anchor = Object.assign({}, act); act = { r: act.r + lines.length - 1, c: act.c + Math.max(...lines.map(l => l.length)) - 1 }; draw(); save();
+  });
+  /* the mouse: click a cell, drag or shift-click for a range, click a letter or number for a column or row */
+  grid.addEventListener("pointerdown", e => {
+    e.stopPropagation(); if (editing) editing.blur();
+    const cell = e.target.closest("[data-r]"), col = e.target.closest("[data-col]"), row = e.target.closest("[data-row]");
+    if (col) { e.preventDefault(); const c = +col.dataset.col; anchor = { r: -1, c: e.shiftKey ? anchor.c : c }; act = { r: tv.rows.length - 1, c }; draw(); grid.focus({ preventScroll: true }); return; }
+    if (row) { e.preventDefault(); const r = +row.dataset.row; anchor = { r: e.shiftKey ? anchor.r : r, c: 0 }; act = { r, c: tv.cols.length - 1 }; draw(); grid.focus({ preventScroll: true }); return; }
+    if (!cell) return;
+    e.preventDefault(); grid.focus({ preventScroll: true });
+    act = { r: +cell.dataset.r, c: +cell.dataset.c }; if (!e.shiftKey) anchor = Object.assign({}, act); draw();
+    const mv = m => { const t = document.elementFromPoint(m.clientX, m.clientY), c2 = t && t.closest && t.closest(".sg-grid [data-r]"); if (c2 && (+c2.dataset.r !== act.r || +c2.dataset.c !== act.c)) { act = { r: +c2.dataset.r, c: +c2.dataset.c }; draw(); } };
+    const up = () => { document.removeEventListener("pointermove", mv); document.removeEventListener("pointerup", up); };
+    document.addEventListener("pointermove", mv); document.addEventListener("pointerup", up);
+  });
+  grid.addEventListener("dblclick", e => { e.stopPropagation(); if (e.target.closest("[data-r]")) edit(); });
+  /* the formula bar edits the active cell */
+  fx.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); setRaw(act.r, act.c, fx.value); save(); move(1, 0); grid.focus({ preventScroll: true }); } if (e.key === "Escape") { fx.value = String(raw(act.r, act.c)); grid.focus({ preventScroll: true }); } });
+  fx.addEventListener("pointerdown", e => e.stopPropagation());
+  const wrap = el("div", { class: "sg" }, bar, fxRow, scroll, status);
+  draw();
+  return { el: wrap, set(v) { if (editing || document.activeElement === fx) return false; const nv = norm(v); if (T.stable(nv) !== T.stable(tv)) { tv = nv; act.r = Math.min(act.r, tv.rows.length - 1); act.c = Math.min(act.c, tv.cols.length - 1); anchor = Object.assign({}, act); draw(); } return true; } };
+}
+
+/* every editor says what its change was made from: commit(value, base). An editor that keeps
+   someone's typing on screen (set() returns false while they are in it) still reports the right
+   base, so the store merges the change with what others wrote meanwhile instead of undoing it. */
+function editorFor(type, value, commit, opts) {
+  let base = clone(value);
+  const ed = editorForRaw(type, value, (v, from) => { const b = from !== undefined ? from : base; base = clone(v); return commit(v, b); }, opts);
+  return Object.assign({}, ed, { el: ed.el, set(v) { const ok = ed.set(v); if (ok !== false) base = clone(v); return ok; } });
+}
+function editorForRaw(type, value, commit, opts) {
+  opts = opts || {};
+  if (type === "doc" || type === "note") {
+    const ta = el("textarea", { class: "ed-doc", placeholder: opts.placeholder || "Write…", "aria-label": opts.label || "Document text" }); ta.value = value == null ? "" : String(value);
+    let t = null; const save = () => { clearTimeout(t); if (ta.value !== String(cur ?? "")) { const from = cur; cur = ta.value; commit(ta.value, from); } };
+    let cur = ta.value;
+    ta.addEventListener("input", () => { clearTimeout(t); t = setTimeout(save, 700); });
+    ta.addEventListener("keydown", e => e.stopPropagation());
+    if (!opts.markdown) {
+      ta.addEventListener("blur", save);
+      return { el: ta, set(v) {
+        const s = v == null ? "" : String(v); if (s === ta.value) { cur = s; return true; }
+        if (document.activeElement !== ta) { ta.value = s; cur = s; return true; }
+        // someone else changed it while you type: their change is folded in around yours, the caret stays put
+        const old = ta.value, merged = T.merge3(String(cur ?? ""), old, s), a = ta.selectionStart, b = ta.selectionEnd;
+        if (merged !== old) { let p = 0; while (p < old.length && p < merged.length && old[p] === merged[p]) p++; const d = merged.length - old.length; ta.value = merged; ta.setSelectionRange(a > p ? a + d : a, b > p ? b + d : b); }
+        cur = s; if (merged !== s) { clearTimeout(t); t = setTimeout(save, 700); }
+        return true;
+      } };
+    }
+    // a document is a word processor: formatted text you edit directly, saved as markdown
+    return docEditor(value, commit, opts);
+  }
+  if (type === "list") {
+    const wrap = el("div", { class: "ed-list" }), ul = el("ul"), add = el("input", { type: "text", placeholder: opts.placeholder || "Add an item and press Enter", "aria-label": "Add an item" });
+    let items = Array.isArray(value) ? clone(value) : [];
+    const norm = x => typeof x === "string" ? { text: x, done: false } : x && typeof x === "object" ? x : { text: String(x), done: false };
+    const draw = () => {
+      ul.replaceChildren(...items.map((raw, i) => {
+        const it = norm(raw);
+        const box = el("button", { type: "button", class: "chk" + (it.done ? " on" : ""), role: "checkbox", "aria-checked": String(!!it.done), "aria-label": "Done", onclick: () => { items[i] = Object.assign({}, it, { done: !it.done }); draw(); commit(clone(items)); } });
+        const txt = el("span", { class: "li-txt" + (it.done ? " done" : ""), contenteditable: "plaintext-only", spellcheck: "false" }, it.text ?? "");
+        txt.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); txt.blur(); } });
+        txt.addEventListener("blur", () => { const v = txt.textContent.trim(); if (v !== (it.text ?? "")) { if (v) items[i] = Object.assign({}, it, { text: v }); else items.splice(i, 1); draw(); commit(clone(items)); } });
+        const rm = el("button", { type: "button", class: "rm", "aria-label": "Remove", onclick: () => { items.splice(i, 1); draw(); commit(clone(items)); } }, "×");
+        return el("li", null, box, txt, rm);
+      }));
+      if (!items.length) ul.append(el("li", { class: "li-empty" }, "Nothing here yet."));
+    };
+    add.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter" && add.value.trim()) { items.push({ text: add.value.trim(), done: false }); add.value = ""; draw(); commit(clone(items)); } });
+    draw(); wrap.append(ul, add);
+    return { el: wrap, set(v) { if (focusedIn(wrap)) return false; const nv = Array.isArray(v) ? clone(v) : []; if (T.stable(nv) !== T.stable(items)) { items = nv; draw(); } return true; } };
+  }
+  if (type === "table") return sheetEditor(value, commit);
+  if (type === "link") {
+    let lv = value && typeof value === "object" ? clone(value) : { url: String(value || ""), title: "" };
+    const wrap = el("div", { class: "ed-link" });
+    const draw = (editing) => {
+      if (editing) {
+        const u = el("input", { type: "url", value: lv.url || "", placeholder: "https://…", "aria-label": "Address" }), ti = el("input", { type: "text", value: lv.title || "", placeholder: "Title", "aria-label": "Title" });
+        const done = () => { let a = u.value.trim(); if (a && !/^[a-z][a-z0-9+.-]*:/i.test(a)) a = "https://" + a; lv = { url: a, title: ti.value.trim() }; commit(clone(lv)); draw(false); };
+        [u, ti].forEach(x => x.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") done(); }));
+        wrap.replaceChildren(ti, u, el("button", { type: "button", class: "btn sm", onclick: done }, "Save")); ti.focus();
+      } else {
+        const href = Store.safeUrl(lv.url);
+        wrap.replaceChildren(href ? el("a", { href, target: "_blank", rel: "noopener" }, lv.title || href.replace(/^https?:\/\//, "")) : el("span", { class: "muted" }, lv.url ? "Not a web address." : "No address yet."), el("small", null, (lv.url || "").replace(/^https?:\/\//, "")), el("button", { type: "button", class: "btn sm ghost", onclick: () => draw(true) }, "Edit"));
+      }
+    };
+    draw(false);
+    return { el: wrap, set(v) { if (focusedIn(wrap)) return false; const nv = v && typeof v === "object" ? clone(v) : { url: String(v || ""), title: "" }; if (T.stable(nv) !== T.stable(lv)) { lv = nv; draw(false); } return true; } };
+  }
+  if (type === "page") {
+    // a small web page of its own, sandboxed: scripts run, but it cannot reach this desktop or Claude
+    let cur = value == null ? "" : String(value), mode = "page";
+    const frame = el("iframe", { class: "pg-frame", sandbox: "allow-scripts allow-forms allow-modals", title: opts.label || "Page", referrerpolicy: "no-referrer" });
+    const src = editorFor("doc", cur, (v, from) => { cur = v; commit(v, from); }, { label: "Page source", placeholder: "<!doctype html>\n<h1>Hello</h1>" });
+    src.el.classList.add("pg-src"); src.el.hidden = true; src.el.spellcheck = false;
+    const show = () => { frame.srcdoc = pageTokens() + (cur.trim() ? cur : "<p style='font:13px Arial,sans-serif;color:#87867f;padding:8px'>An empty page. Ask Claude what should be on it.</p>"); };
+    const tog = el("button", { type: "button", class: "btn sm ghost pg-tog", onclick: () => { mode = mode === "page" ? "source" : "page"; frame.hidden = mode !== "page"; src.el.hidden = mode === "page"; tog.textContent = mode === "page" ? "Source" : "Page"; if (mode === "page") show(); } }, "Source");
+    tog.hidden = !devMode();
+    const wrap = el("div", { class: "ed-page" }, tog, frame, src.el); show();
+    return { el: wrap, set(v) { const s = v == null ? "" : String(v); if (s === cur) return true; cur = s; src.set(s); if (mode === "page") show(); return true; } };
+  }
+  // data (and anything unknown): JSON, editable as text
+  const wrap = el("div", { class: "ed-data" }), pre = el("pre"), err = el("div", { class: "ed-err", hidden: true });
+  let dv = clone(value);
+  const show = () => { pre.textContent = JSON.stringify(dv, null, 2) ?? "null"; };
+  const ta = el("textarea", { class: "ed-json", hidden: true, spellcheck: "false", "aria-label": "JSON" });
+  const edit = el("button", { type: "button", class: "btn sm ghost", onclick: () => { ta.value = JSON.stringify(dv, null, 2); ta.hidden = false; pre.hidden = true; edit.hidden = true; ta.focus(); } }, "Edit JSON");
+  ta.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Escape") { ta.hidden = true; pre.hidden = false; edit.hidden = false; err.hidden = true; } });
+  ta.addEventListener("blur", () => { try { dv = JSON.parse(ta.value); err.hidden = true; ta.hidden = true; pre.hidden = false; edit.hidden = false; show(); commit(clone(dv)); } catch (e) { err.hidden = false; err.textContent = "Not valid JSON: " + e.message + ". Fix it or press Escape."; } });
+  show(); wrap.append(pre, ta, err, edit);
+  return { el: wrap, set(v) { if (focusedIn(wrap)) return false; if (T.stable(v) !== T.stable(dv)) { dv = clone(v); show(); } return true; } };
+}
+
+/* ---------- pages share the desktop's tokens: colors, type, and a few opt-in parts (cc-*) ---------- */
+const PAGE_TOKENS = ["canvas", "surface", "panel-2", "ink", "ink-2", "muted", "line", "line-2", "hair", "accent", "accent-ink", "accent-soft", "clay", "sky", "olive", "kraft", "positive", "danger", "warn", "e1", "e2", "r", "font"];
+function pageTokens() {
+  const cs = getComputedStyle(document.documentElement), vars = PAGE_TOKENS.map(k => `--${k}: ${cs.getPropertyValue("--" + k).trim()};`).join(" ");
+  return `<style id="cc-tokens">:root { ${vars} color-scheme: ${cs.colorScheme || "light"}; }
+:where(body) { margin: 0; padding: 20px; font: 14px/1.5 var(--font); color: var(--ink); background: var(--surface); }
+:where(h1) { font-size: 32px; line-height: 1.05; letter-spacing: -0.03em; margin: 0 0 12px; } :where(h2) { font-size: 20px; letter-spacing: -0.02em; margin: 24px 0 8px; } :where(a) { color: inherit; text-decoration-color: var(--accent); text-underline-offset: 2px; }
+.cc-label { font-size: 10px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.cc-btn { display: inline-flex; align-items: center; height: 34px; padding: 0 14px; border: 1px solid var(--ink); border-radius: var(--r); background: var(--ink); color: var(--surface); font: 700 13px var(--font); cursor: pointer; text-decoration: none; }
+.cc-btn.ghost { background: transparent; color: var(--ink); } .cc-btn.accent { background: var(--accent); border-color: var(--accent); }
+.cc-card { background: var(--surface); border-radius: var(--r); box-shadow: var(--e1); padding: 16px; }
+.cc-stat { border-top: 1px solid var(--ink); padding-top: 7px; } .cc-stat b { display: block; font-size: 26px; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+.cc-tag { display: inline-flex; height: 20px; align-items: center; padding: 0 7px; border-radius: 10px; background: var(--accent-soft); color: var(--accent-ink); font-size: 11px; font-weight: 700; }
+.cc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+.cc-input { height: 34px; border: 1px solid var(--line-2); border-radius: var(--r); background: var(--panel-2); padding: 0 10px; font: 13px var(--font); color: var(--ink); }
+.cc-rule { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }</style>`;
+}
+
+/* ---------- note cards (on the desktop, in streams, in the inbox) ---------- */
+function noteCard(n, o) {
+  o = o || {};
+  const card = el("div", { class: `card k-${n.kind}${o.tone ? " tone-" + o.tone : ""}${o.dim ? " dim" : ""}${n.done ? " is-done" : ""}${n.fresh ? " fresh" : ""}`, "data-note": n.id || null, "data-drag": n.id ? "note" : null, tabindex: n.id ? "0" : null });
+  const eye = el("div", { class: "eye" }, el("i", { class: "g", "data-act": n.kind === "task" && n.id ? "toggle" : null, role: n.kind === "task" ? "checkbox" : null, "aria-checked": n.kind === "task" ? String(!!n.done) : null, "aria-label": n.kind === "task" ? "Done" : null }), KIND_LABEL[n.kind] || "Note");
+  if (n.id || n.kind !== "note") card.append(eye);
+  card.append(el("div", { class: "txt" }, n.text ?? ""));
+  const href = n.url && Store.safeUrl(n.url);
+  if (href) card.append(el("a", { class: "url", href, target: "_blank", rel: "noopener" }, href.replace(/^https?:\/\//, "")));
+  if (n.id || (n.tags && n.tags.length)) card.append(el("div", { class: "meta" }, el("span", { class: "tags" }, (n.tags || []).map(t => "#" + t).join(" ")), n.id ? el("span", { class: "who by-" + n.by }, `${Store.label(n.by, n.who)} ${n.at ? hhmm(n.at) : ""}`.trim()) : null));
+  if (n.id) card.append(el("span", { class: "handle", "data-drag": "link", "data-id": n.id, title: "Drag onto another note to link" }));
+  return card;
+}
+
+/* ==========================================================================
+   MARKDOWN · docs, slides, sites and md() read as formatted text.
+   Small and safe: text is escaped first; only http(s) links become links.
+   ========================================================================== */
+const mdEsc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function mdInline(s) {
+  s = mdEsc(s); const codes = [];
+  s = s.replace(/`([^`]+)`/g, (_, a) => { codes.push(a); return "\u0000" + (codes.length - 1) + "\u0000"; });
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/~~([^~]+)~~/g, "<s>$1</s>").replace(/(^|[^\w*])\*([^*\n]+)\*(?=[^\w*]|$)/g, "$1<em>$2</em>").replace(/(^|[^\w_])_([^_\n]+)_(?=[^\w_]|$)/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, t, u) => /^https?:\/\//i.test(u) ? `<a href="${u.replace(/"/g, "%22")}" target="_blank" rel="noopener">${t}</a>` : t);
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
+}
+/* markdown → element; hooks.code(lang, text) may return a node for a fenced block */
+function mdRender(src, hooks) {
+  hooks = hooks || {};
+  const out = document.createDocumentFragment(), lines = String(src ?? "").replace(/\r/g, "").split("\n"), para = []; let i = 0;
+  const flush = () => { if (para.length) { const p = el("p"); p.innerHTML = mdInline(para.join(" ")); out.appendChild(p); para.length = 0; } };
+  while (i < lines.length) {
+    const l = lines[i]; let m;
+    if ((m = /^(`{3,})(.*)$/.exec(l))) {
+      flush(); const fence = m[1], lang = m[2].trim(), buf = []; i++;
+      while (i < lines.length && lines[i].trim() !== fence) buf.push(lines[i++]); i++;
+      const code = buf.join("\n"), hooked = hooks.code && hooks.code(lang, code);
+      out.appendChild(hooked || el("pre", { class: "md-code" }, code)); continue;
+    }
+    if (/^\s*(---+|\*\*\*+)\s*$/.test(l)) { flush(); out.appendChild(el("hr")); i++; continue; }
+    if ((m = /^(#{1,4})\s+(.*)/.exec(l))) { flush(); const h = el("h" + m[1].length); h.innerHTML = mdInline(m[2]); out.appendChild(h); i++; continue; }
+    if (/^>\s?/.test(l)) { flush(); const buf = []; while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, "")); const q = el("blockquote"); q.innerHTML = mdInline(buf.join(" ")); out.appendChild(q); continue; }
+    if (/^\|/.test(l)) {
+      flush(); const rows = []; while (i < lines.length && /^\|/.test(lines[i])) rows.push(lines[i++]);
+      const cells = r => r.replace(/^\||\|\s*$/g, "").split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, "|"));
+      const body = rows.filter((r, k) => !(k === 1 && /^[\s|:-]+$/.test(r)));
+      const t = el("table"), head = cells(body[0] || "");
+      t.append(el("thead", null, el("tr", null, ...head.map(h => { const th = el("th"); th.innerHTML = mdInline(h); return th; }))));
+      const tb = el("tbody"); body.slice(1).forEach(r => tb.appendChild(el("tr", null, ...cells(r).map(c => { const td = el("td"); td.innerHTML = mdInline(c); if (/^-?[\d.,]+%?$/.test(c)) td.className = "n"; return td; }))));
+      t.append(tb); out.appendChild(el("div", { class: "md-table" }, t)); continue;
+    }
+    if (/^(\s*)([-*+]|\d+[.)])\s+/.test(l)) {
+      flush(); const ordered = /^\s*\d+[.)]/.test(l), list = el(ordered ? "ol" : "ul");
+      while (i < lines.length && /^(\s*)([-*+]|\d+[.)])\s+/.test(lines[i])) {
+        let text = lines[i].replace(/^(\s*)([-*+]|\d+[.)])\s+/, ""); i++;
+        while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !/^(\s*)([-*+]|\d+[.)])\s+/.test(lines[i])) text += " " + lines[i++].trim();
+        const li = el("li"), cb = /^\[( |x|X)\]\s+/.exec(text);
+        if (cb) { li.className = "md-task" + (/x/i.test(cb[1]) ? " on" : ""); text = text.slice(cb[0].length); li.append(el("i", { class: "md-box" })); }
+        const span = el("span"); span.innerHTML = mdInline(text); li.append(span); list.appendChild(li);
+      }
+      out.appendChild(list); continue;
+    }
+    if (!l.trim()) { flush(); i++; continue; }
+    para.push(l.trim()); i++;
+  }
+  flush();
+  const wrap = el("div", { class: "md" }); wrap.append(out); return wrap;
+}
+
+/* ==========================================================================
+   FORMULAS · a table becomes a spreadsheet when a cell starts with "=".
+   A1 is the first column, first row under the header; ranges are A1:B4.
+   SUM AVG(AVERAGE) MIN MAX COUNT ROUND ABS IF, + − × ÷ and comparisons.
+   Formulas are tokenized against that vocabulary, never run as free code,
+   so a formula anyone types can only do arithmetic.
+   ========================================================================== */
+const colName = i => { let s = ""; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
+const colIndex = s => { let n = 0; for (const ch of s) n = n * 26 + (ch.charCodeAt(0) - 64); return n - 1; };
+const FX = {
+  SUM: a => a.flat(9).reduce((s, x) => s + (Number(x) || 0), 0),
+  AVG: a => { const v = a.flat(9).filter(x => x !== "" && !isNaN(Number(x))); return v.length ? v.reduce((s, x) => s + Number(x), 0) / v.length : 0; },
+  MIN: a => Math.min(...a.flat(9).filter(x => x !== "" && !isNaN(Number(x))).map(Number)),
+  MAX: a => Math.max(...a.flat(9).filter(x => x !== "" && !isNaN(Number(x))).map(Number)),
+  COUNT: a => a.flat(9).filter(x => x !== "" && x != null).length,
+  ROUND: a => { const p = Math.pow(10, Number(a[1]) || 0); return Math.round(Number(a[0]) * p) / p; },
+  ABS: a => Math.abs(Number(a[0]) || 0),
+  IF: a => (a[0] ? a[1] : a[2]),
+};
+FX.AVERAGE = FX.AVG;
+function sheetEval(rows, depth, seen) {
+  const cache = new Map();
+  const val = (r, c, stack) => {
+    const key = r + ":" + c; if (cache.has(key)) return cache.get(key);
+    if (stack.has(key)) return "#CYCLE";
+    const raw = rows[r] ? rows[r][c] : "";
+    if (typeof raw !== "string" || raw[0] !== "=") { const n = Number(raw); const v = raw === "" || raw == null ? "" : isNaN(n) ? raw : n; cache.set(key, v); return v; }
+    stack.add(key); const v = formula(raw.slice(1), stack); stack.delete(key); cache.set(key, v); return v;
+  };
+  const formula = (src, stack) => {
+    const toks = src.match(/\s*([A-Z]+[0-9]+:[A-Z]+[0-9]+|[A-Z]+[0-9]+|[A-Z]+(?=\s*\()|\d+(?:\.\d+)?|"[^"]*"|<=|>=|<>|!=|==|[-+*/(),<>=&])/gy);
+    if (!toks || toks.join("").replace(/\s+/g, "") !== src.replace(/\s+/g, "")) return "#ERROR";
+    const args = [], parts = [];
+    for (let t of toks) {
+      t = t.trim(); let m;
+      if ((m = /^([A-Z]+)([0-9]+):([A-Z]+)([0-9]+)$/.exec(t))) { const c0 = colIndex(m[1]), r0 = +m[2] - 1, c1 = colIndex(m[3]), r1 = +m[4] - 1, block = []; for (let r = Math.min(r0, r1); r <= Math.max(r0, r1); r++) for (let c = Math.min(c0, c1); c <= Math.max(c0, c1); c++) block.push(val(r, c, stack)); args.push(block); parts.push(`A[${args.length - 1}]`); }
+      else if ((m = /^([A-Z]+)([0-9]+)$/.exec(t))) { args.push(val(+m[2] - 1, colIndex(m[1]), stack)); parts.push(`A[${args.length - 1}]`); }
+      else if (/^[A-Z]+$/.test(t)) { if (!FX[t]) return "#NAME"; parts.push(`F.${t}`); }
+      else if (t === "<>" || t === "!=") parts.push("!=");
+      else if (t === "=") parts.push("==");
+      else if (t === "&") parts.push("+''+");
+      else parts.push(t);
+    }
+    // function calls take their arguments as one list
+    const code = parts.join(" ").replace(/F\.([A-Z]+) \(/g, "F.$1([").replace(/\(\[ \)/g, "([])");
+    let fixed = "", open = []; for (const tk of code.split(/(\(\[|\(|\))/)) { if (tk === "([") { open.push(true); fixed += "(["; } else if (tk === "(") { open.push(false); fixed += "("; } else if (tk === ")") { fixed += open.pop() ? "])" : ")"; } else fixed += tk; }
+    try { const v = new Function("A", "F", `"use strict"; return (${fixed});`)(args, FX); return typeof v === "number" ? (isFinite(v) ? Math.round(v * 1e9) / 1e9 : "#DIV/0") : v; } catch (e) { return "#ERROR"; }
+  };
+  return (r, c) => val(r, c, new Set());
+}
+/* a store of records, by name: the data of a @@records app, a data file holding { records }, or a new one */
+function recordStore(name, create) {
+  const n = String(name || "").trim();
+  const f = Store.byName(n + " · data", "data") || Store.list().find(x => x.type === "data" && x.name === n && x.content && Array.isArray(x.content.records));
+  if (f) return f;
+  if (!create) return null;
+  return Store.add({ type: "data", name: n, content: { fields: [], records: [] }, placed: false, kit: "records" }, create);
+}
+function recordsOp(name, op, arg, arg2, by) {
+  const f = recordStore(name, op === "add" ? by : null); if (!f) { if (op === "list") return []; throw new Error(`No records called “${name}”.`); }
+  const d = Object.assign({ fields: [], records: [] }, f.content || {}), recs = (d.records || []).slice();
+  const match = (r, q) => !q || Object.entries(q).every(([k, v]) => typeof v === "function" ? false : String(r[k] ?? "").toLowerCase() === String(v).toLowerCase());
+  if (op === "list") return clone(recs.filter(r => match(r, arg)));
+  if (op === "add") { const rec = Object.assign({ id: "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5) }, arg || {}); const fields = [...new Set((d.fields || []).concat(Object.keys(rec).filter(k => k !== "id")))]; Store.update(f.id, { content: Object.assign({}, d, { fields, records: recs.concat([rec]) }) }, by, "edit"); return rec.id; }
+  const i = recs.findIndex(r => r.id === arg); if (i < 0) throw new Error(`No record ${arg} in “${name}”.`);
+  if (op === "update") { recs[i] = Object.assign({}, recs[i], arg2 || {}, { id: recs[i].id }); const fields = [...new Set((d.fields || []).concat(Object.keys(arg2 || {})))]; Store.update(f.id, { content: Object.assign({}, d, { fields, records: recs }) }, by, "edit"); return true; }
+  if (op === "remove") { recs.splice(i, 1); Store.update(f.id, { content: Object.assign({}, d, { records: recs }) }, by, "edit"); return true; }
+}
+const fmtCell = v => typeof v === "number" ? v.toLocaleString("en-US", { maximumFractionDigits: 4 }) : String(v ?? "");
+
+/* ---------- people, as this viewer sees them: a round face and a first name ---------- */
+const personName = id => Store.label("you", id);
+const fullName = id => { const p = Store.person(id); return p && p.name ? p.name : p && p.guest ? "A guest" : id === Store.me.id ? "You" : "Someone"; };
+const initials = s => (String(s || "").trim().split(/\s+/).map(w => w[0] || "").join("").slice(0, 2) || "·").toUpperCase();
+function face(id, o) {
+  o = o || {}; const p = Store.person(id) || { name: "", color: "#8A8A85" };
+  const f = el("span", { class: "face" + (o.cls ? " " + o.cls : ""), title: o.title || personName(id), style: `--pc:${p.color}` });
+  if (p.avatarUrl) f.append(el("img", { src: p.avatarUrl, alt: "", draggable: "false", referrerpolicy: "no-referrer" })); else f.textContent = initials(p.name || (p.guest ? "Guest" : "?"));
+  return f;
+}
+function faces(ids, max) {
+  max = max || 4; const list = [...new Set(ids)].filter(Boolean), box = el("span", { class: "faces" });
+  list.slice(0, max).forEach(id => box.append(face(id)));
+  if (list.length > max) box.append(el("span", { class: "face more", title: list.slice(max).map(personName).join(", ") }, "+" + (list.length - max)));
+  return box;
+}
+/* someone else's code, before it runs: who changed it last, what it is, and Run it (or a look at the code first) */
+function trustPanel(f, after, program) {
+  const who = f.ewho || f.who, by = f.eby || f.by, name = who || by !== "you" ? Store.label(by, who) : "someone";
+  const code = el("pre", { class: "trust-code", hidden: true }); code.innerHTML = highlight(String(f.content || ""));
+  const box = el("div", { class: "trust" },
+    el("div", { class: "trust-h" }, svgIcon("lock", 16), el("b", null, program ? "Run this program?" : "Run this app?")),
+    el("p", null, `${name} changed “${f.name}” last. ${program ? "Programs" : "Apps"} are code: ${program ? "it runs on your computer" : "it runs in this page"}, with what you can see and do here. Run it if you trust where it came from.`),
+    el("div", { class: "trust-a" },
+      el("button", { type: "button", class: "btn sm primary", onclick: ev => { ev.stopPropagation(); T.Trust.allow(f.content).then(() => after && after()); } }, "Run it"),
+      el("button", { type: "button", class: "btn sm ghost", onclick: ev => { ev.stopPropagation(); code.hidden = !code.hidden; ev.currentTarget.textContent = code.hidden ? "Look at the code" : "Hide the code"; } }, "Look at the code")),
+    code);
+  box.addEventListener("pointerdown", e => e.stopPropagation());
+  return box;
+}
+const kbtn = (label, cls, fn, aria) => el("button", { type: "button", class: "btn sm " + (cls || ""), "aria-label": aria || null, title: aria || null, onclick: ev => { ev.stopPropagation(); fn(ev); } }, label);
+const kstat = (label, value, tone) => el("div", { class: "k-stat" + (tone ? " " + tone : "") }, el("span", null, label), el("b", null, value));
+const kempty = text => el("div", { class: "k-empty" }, text);
+const SERIES = ["var(--clay)", "var(--sky)", "var(--olive)", "var(--ink)", "var(--kraft)", "var(--muted)"];
+const STICKY = { yellow: "#EBDBBC", pink: "#F2D3C7", blue: "#D3E1EF", green: "#DCE3D1", grey: "#E8E6DC", purple: "#DDD8E6", orange: "#F0C9B8" };
+
+/* ---------- editing parts, shared by every built-in app's Edit mode ---------- */
+/* a field that saves when it changes (on Enter or leaving it); Escape puts the old text back */
+function kin(value, onSave, o) {
+  o = o || {}; const long = !!o.long, v0 = value == null ? "" : String(value);
+  const i = el(long ? "textarea" : "input", { class: "ke-in" + (o.cls ? " " + o.cls : ""), type: long ? null : o.type || "text", rows: long ? String(o.rows || 3) : null, placeholder: o.placeholder || "", "aria-label": o.label || o.placeholder || "Text", spellcheck: o.code ? "false" : null });
+  i.value = v0;
+  i.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter" && !long) { e.preventDefault(); i.blur(); } if (e.key === "Escape") { i.value = v0; i.blur(); } });
+  i.addEventListener("pointerdown", e => e.stopPropagation());
+  i.addEventListener("change", () => { if (i.value !== v0) onSave(i.value); });
+  return i;
+}
+/* an input that adds what is typed on Enter, then clears */
+/* (after adding, the app redraws with the new item and the cursor comes back here, ready for the next) */
+let KFOCUS = null;
+function kadd(placeholder, onAdd, key) {
+  key = key || placeholder;
+  const i = el("input", { type: "text", class: "ke-in ke-new", placeholder, "aria-label": placeholder });
+  i.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter" && i.value.trim()) { const v = i.value.trim(); i.value = ""; KFOCUS = { key, at: Date.now() }; i.blur(); onAdd(v); } });
+  if (KFOCUS && KFOCUS.key === key && Date.now() - KFOCUS.at < 2000) { KFOCUS = null; setTimeout(() => { if (i.isConnected) i.focus({ preventScroll: true }); }, 0); }
+  i.addEventListener("pointerdown", e => e.stopPropagation());
+  return i;
+}
+const kicon = (sym, label, fn, off) => el("button", { type: "button", class: "ke-ic", "aria-label": label, "data-tip": label, disabled: off ? true : null, onclick: ev => { ev.stopPropagation(); fn(); } }, sym);
+/* ↑ ↓ × for the i-th of n */
+const ktools = (i, n, move, remove, what) => el("span", { class: "ke-tools" }, kicon("↑", `Move ${what} up`, () => move(i, -1), i === 0), kicon("↓", `Move ${what} down`, () => move(i, 1), i === n - 1), kicon("×", `Remove ${what}`, () => remove(i)));
+const kmove = (arr, i, d) => { const a = arr.slice(), j = i + d; if (j < 0 || j >= a.length) return a; [a[i], a[j]] = [a[j], a[i]]; return a; };
+const kswitch = (label, on, fn) => el("label", { class: "ke-switch" }, el("button", { type: "button", class: "switch", role: "switch", "aria-checked": String(!!on), "aria-label": label, onclick: ev => { ev.stopPropagation(); fn(!on); } }), el("span", null, label));
+const kedit = (...kids) => el("div", { class: "k k-edit" }, ...kids);
+const klabel = text => el("div", { class: "ke-label" }, text);
+/* text in place: double-click to change it, Enter to keep it */
+function kinline(node, value, onSave) {
+  node.addEventListener("dblclick", ev => {
+    ev.stopPropagation(); if (node.isContentEditable) return;
+    node.contentEditable = "plaintext-only"; node.spellcheck = false; node.focus();
+    const r = document.createRange(); r.selectNodeContents(node); const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+    const done = keep => { node.removeEventListener("blur", onBlur); node.contentEditable = "false"; const v = node.textContent.trim(); if (keep && v && v !== value) onSave(v); else node.textContent = value; };
+    const onBlur = () => done(true);
+    node.addEventListener("blur", onBlur);
+    node.addEventListener("keydown", function k(e) { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); node.removeEventListener("keydown", k); node.blur(); } if (e.key === "Escape") { node.removeEventListener("keydown", k); done(false); } });
+  });
+  node.title = node.title || "Double-click to edit";
+  return node;
+}
+
+/* ==========================================================================
+   BUILT-IN APP VIEWS · one per kit, in the house style. view(data, api):
+   api.preview draws without interaction (drafts while Claude writes);
+   api.editing shows the app's Edit mode (every app can be changed in place,
+   no code); api.write(next, what) saves the data file and logs `what` as
+   something the person did ("answered Q2: Lisbon"), which Claude reads;
+   api.claude(say, data) hands the turn to Claude from the person's click.
+   ========================================================================== */
+const KIT_EDIT = {
+  quiz(d, api) {
+    const qs = (d.questions || []).map(q => Object.assign({ q: "", options: [], answer: -1, why: "" }, q)), ans = d.answers || {};
+    const save = (next, answers, what) => api.write(Object.assign({}, d, { questions: next, answers }), what);
+    const upd = (i, patch, what) => { const next = qs.slice(); next[i] = Object.assign({}, qs[i], patch); const a = Object.assign({}, ans); if ("options" in patch || "answer" in patch) delete a[i]; save(next, a, what); };
+    const move = (i, dd) => { const j = i + dd, a = Object.assign({}, ans); const x = a[i], y = a[j]; delete a[i]; delete a[j]; if (y !== undefined) a[i] = y; if (x !== undefined) a[j] = x; save(kmove(qs, i, dd), a, `moved question ${i + 1}`); };
+    const remove = i => { const a = {}; for (const [k, v] of Object.entries(ans)) { const n = Number(k); if (n < i) a[n] = v; else if (n > i) a[n - 1] = v; } save(qs.filter((_, k) => k !== i), a, `removed “${qs[i].q}”`); };
+    const root = kedit();
+    qs.forEach((q, i) => {
+      const sec = el("section", { class: "ke-card" }, el("div", { class: "ke-head" }, el("span", { class: "ke-n" }, String(i + 1).padStart(2, "0")), kin(q.q, v => upd(i, { q: v }, `reworded question ${i + 1}`), { placeholder: "Question", cls: "strong" }), ktools(i, qs.length, move, remove, "question")));
+      q.options.forEach((o, j) => sec.append(el("div", { class: "ke-row" },
+        el("button", { type: "button", class: "ke-right" + (q.answer === j ? " on" : ""), role: "radio", "aria-checked": String(q.answer === j), "aria-label": `${o} is the right answer`, title: "The right answer", onclick: ev => { ev.stopPropagation(); upd(i, { answer: j }, `made “${o}” the answer to question ${i + 1}`); } }),
+        kin(o, v => upd(i, { options: q.options.map((x, k) => k === j ? v : x) }, `changed an option in question ${i + 1}`), { placeholder: "Option" }),
+        kicon("×", "Remove option", () => upd(i, { options: q.options.filter((_, k) => k !== j), answer: q.answer === j ? -1 : q.answer > j ? q.answer - 1 : q.answer }, `removed option “${o}”`)))));
+      sec.append(el("div", { class: "ke-row" }, el("span", { class: "ke-right ghost" }), kadd("Add an option", v => upd(i, { options: q.options.concat([v]), answer: q.answer < 0 && !q.options.length ? 0 : q.answer }, `added option “${v}”`), "quiz-opt-" + i)));
+      sec.append(kin(q.why, v => upd(i, { why: v }, `explained question ${i + 1}`), { placeholder: "Why, shown after answering (optional)", cls: "soft" }));
+      root.append(sec);
+    });
+    root.append(el("div", { class: "k-actions" }, kbtn("+ Question", "", () => save(qs.concat([{ q: "A new question?", options: ["Yes", "No"], answer: 0, why: "" }]), ans, "added a question"))));
+    return root;
+  },
+  poll(d, api) {
+    const opts = d.options || [], picked = d.picked || [];
+    const save = (patch, what) => api.write(Object.assign({}, d, patch), what);
+    const setOpts = (next, what) => save({ options: next, picked: picked.map(i => next.indexOf(opts[i])).filter(i => i >= 0) }, what);
+    return kedit(
+      klabel("Question"), kin(d.question, v => save({ question: v }, "changed the question"), { placeholder: "What should we decide?", cls: "strong" }),
+      klabel("Options"),
+      ...opts.map((o, j) => el("div", { class: "ke-row" }, kin(o, v => setOpts(opts.map((x, k) => k === j ? v : x), `renamed “${o}” to “${v}”`), { placeholder: "Option" }), ktools(j, opts.length, (i, dd) => setOpts(kmove(opts, i, dd), "reordered options"), i => setOpts(opts.filter((_, k) => k !== i), `removed “${o}”`), "option"))),
+      kadd("Add an option", v => setOpts(opts.concat([v]), `added “${v}”`)),
+      kswitch("People can pick several", d.multi, on => save({ multi: on, picked: on ? picked : picked.slice(0, 1) }, on ? "allowed several picks" : "allowed one pick")));
+  },
+  form(d, api) {
+    const fields = d.fields || [], TYPES = [["text", "Short text"], ["long", "Long text"], ["number", "Number"], ["date", "Date"], ["email", "Email"], ["yes", "Yes / no"], ["choice", "Choice"]];
+    const save = (patch, what) => api.write(Object.assign({}, d, patch), what);
+    const setF = (next, what) => save({ fields: next }, what);
+    const keyFor = label => { let k = String(label).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 40) || "field", n = k, i = 2; while (fields.some(f => f.key === n)) n = k + "_" + i++; return n; };
+    const root = kedit(klabel("Introduction"), kin(d.intro, v => save({ intro: v }, "changed the introduction"), { long: true, rows: 2, placeholder: "A line about what this form is for" }), klabel("Fields"));
+    fields.forEach((f, i) => {
+      const type = el("select", { class: "ke-in ke-type", "aria-label": `Type of ${f.label}` }, ...TYPES.map(([v, l]) => el("option", { value: v, selected: f.type === v ? true : null }, l)));
+      type.addEventListener("change", () => { const next = fields.slice(); next[i] = Object.assign({}, f, { type: type.value }, type.value === "choice" && !f.options ? { options: ["One", "Two"] } : {}); setF(next, `made “${f.label}” a ${type.selectedOptions[0].textContent.toLowerCase()} field`); });
+      type.addEventListener("pointerdown", e => e.stopPropagation());
+      const row = el("div", { class: "ke-card ke-field" }, el("div", { class: "ke-row" }, kin(f.label, v => { const next = fields.slice(); next[i] = Object.assign({}, f, { label: v }); setF(next, `renamed “${f.label}” to “${v}”`); }, { placeholder: "Label", cls: "strong" }), type, ktools(i, fields.length, (k, dd) => setF(kmove(fields, k, dd), "reordered fields"), k => setF(fields.filter((_, x) => x !== k), `removed “${f.label}”`), "field")));
+      if (f.type === "choice") row.append(kin((f.options || []).join(", "), v => { const next = fields.slice(); next[i] = Object.assign({}, f, { options: v.split(",").map(x => x.trim()).filter(Boolean) }); setF(next, `changed the choices for “${f.label}”`); }, { placeholder: "Choices, separated by commas", cls: "soft" }));
+      root.append(row);
+    });
+    root.append(kadd("Add a field: type its label", v => setF(fields.concat([{ key: keyFor(v), label: v, type: "text" }]), `added the field “${v}”`)));
+    return root;
+  },
+  chart(d, api) {
+    const cols = (d.cols || []).slice(), rows = (d.rows || []).map(r => [].concat(r));
+    const save = (patch, what) => api.write(Object.assign({}, d, { cols, rows }, patch), what);
+    const num = v => /^-?\d+(\.\d+)?$/.test(String(v).trim()) ? Number(v) : v;
+    const grid = el("table", { class: "ke-grid" });
+    grid.append(el("thead", null, el("tr", null, ...cols.map((c, j) => el("th", null, el("div", { class: "ke-row" }, kin(c, v => { cols[j] = v; save({}, `renamed the column “${c}” to “${v}”`); }, { placeholder: j ? "Series" : "Label" }), j ? kicon("×", `Remove ${c}`, () => save({ cols: cols.filter((_, k) => k !== j), rows: rows.map(r => r.filter((_, k) => k !== j)) }, `removed the series “${c}”`)) : null))), el("th"))));
+    grid.append(el("tbody", null, ...rows.map((r, i) => el("tr", null, ...cols.map((_, j) => el("td", null, kin(r[j] ?? "", v => { rows[i][j] = j ? num(v) : v; save({}, `set ${r[0] ?? "row " + (i + 1)} · ${cols[j]} to ${v}`); }, { placeholder: j ? "0" : "Label", cls: j ? "n" : "" }))), el("td", null, ktools(i, rows.length, (k, dd) => save({ rows: kmove(rows, k, dd) }, "reordered rows"), k => save({ rows: rows.filter((_, x) => x !== k) }, `removed the row “${r[0]}”`), "row"))))));
+    const kind = el("div", { class: "ke-seg", role: "radiogroup", "aria-label": "Chart type" }, ...[["bar", "Bars"], ["line", "Line"]].map(([k, l]) => el("button", { type: "button", role: "radio", "aria-checked": String((d.kind || "bar") === k), onclick: ev => { ev.stopPropagation(); save({ kind: k }, `showed it as ${l.toLowerCase()}`); } }, l)));
+    return kedit(el("div", { class: "ke-bar" }, kind, el("span", { class: "grow" }), kbtn("+ Row", "ghost", () => save({ rows: rows.concat([cols.map((_, j) => j ? 0 : "New")]) }, "added a row")), kbtn("+ Series", "ghost", () => save({ cols: cols.concat(["Series " + cols.length]), rows: rows.map(r => r.concat([0])) }, "added a series"))), el("div", { class: "ke-scroll" }, grid));
+  },
+  board(d, api) {
+    const cols = d.columns || [], items = d.items || [];
+    const save = (patch, what) => api.write(Object.assign({}, d, patch), what);
+    return kedit(klabel("Columns"),
+      ...cols.map((c, i) => el("div", { class: "ke-row" }, kin(c, v => { if (cols.includes(v)) return; save({ columns: cols.map(x => x === c ? v : x), items: items.map(it => it.column === c ? Object.assign({}, it, { column: v }) : it) }, `renamed the column “${c}” to “${v}”`); }, { placeholder: "Column" }), el("span", { class: "ke-count" }, String(items.filter(it => it.column === c).length)),
+        ktools(i, cols.length, (k, dd) => save({ columns: kmove(cols, k, dd) }, "reordered columns"), k => { if (cols.length < 2) return; const to = cols[k === 0 ? 1 : 0]; save({ columns: cols.filter((_, x) => x !== k), items: items.map(it => it.column === c ? Object.assign({}, it, { column: to }) : it) }, `removed the column “${c}”`); }, "column"))),
+      kadd("Add a column", v => { if (!cols.includes(v)) save({ columns: cols.concat([v]) }, `added the column “${v}”`); }));
+  },
+  timeline(d, api) {
+    const items = d.items || [];
+    const save = (next, what) => api.write(Object.assign({}, d, { items: next }), what);
+    const set = (i, patch, what) => { const next = items.slice(); next[i] = Object.assign({}, items[i], patch); save(next, what); };
+    return kedit(
+      ...items.map((it, i) => el("div", { class: "ke-row" }, kin(it.when, v => set(i, { when: v }, `moved “${it.text}” to ${v}`), { placeholder: "When", cls: "ke-when" }), kin(it.text, v => set(i, { text: v }, `renamed “${it.text}” to “${v}”`), { placeholder: "What happens" }), ktools(i, items.length, (k, dd) => save(kmove(items, k, dd), "reordered steps"), k => save(items.filter((_, x) => x !== k), `removed “${it.text}”`), "step"))),
+      kadd("Add a step, like “Fri: review”", v => { const m = /^(.{1,40}?):\s+(.+)$/.exec(v); save(items.concat([m ? { when: m[1], text: m[2], done: false } : { when: "", text: v, done: false }]), `added “${v}”`); }));
+  },
+  cards(d, api) {
+    const cards = d.cards || [];
+    const save = (patch, what) => api.write(Object.assign({}, d, patch), what);
+    const set = (i, patch, what) => { const next = cards.slice(); next[i] = Object.assign({}, cards[i], patch); save({ cards: next }, what); };
+    const root = kedit(kswitch("People choose one", d.pick, on => save({ pick: on, picked: on ? d.picked : null }, on ? "let people choose a card" : "made the cards read-only")));
+    cards.forEach((c, i) => root.append(el("section", { class: "ke-card" },
+      el("div", { class: "ke-head" }, kin(c.title, v => set(i, { title: v }, `renamed “${c.title}” to “${v}”`), { placeholder: "Title", cls: "strong" }), ktools(i, cards.length, (k, dd) => save({ cards: kmove(cards, k, dd), picked: null }, "reordered cards"), k => save({ cards: cards.filter((_, x) => x !== k), picked: null }, `removed “${c.title}”`), "card")),
+      klabel("Facts, one per line as Key: value"),
+      kin((c.facts || []).map(([k, v]) => `${k}: ${v}`).join("\n"), v => set(i, { facts: v.split("\n").map(l => /^([^:]{1,28}):\s*(.*)$/.exec(l.trim())).filter(Boolean).map(m => [m[1].trim(), m[2].trim()]) }, `changed the facts of “${c.title}”`), { long: true, rows: 3, placeholder: "Price: 120\nTime: 2 weeks" }),
+      kin(c.body, v => set(i, { body: v }, `changed the text of “${c.title}”`), { long: true, rows: 2, placeholder: "A few words about it", cls: "soft" }))));
+    root.append(el("div", { class: "k-actions" }, kbtn("+ Card", "", () => save({ cards: cards.concat([{ title: "New option", facts: [], body: "" }]) }, "added a card"))));
+    return root;
+  },
+  slides(d, api) {
+    const slides = (d.slides || []).slice(), n = slides.length, at = Math.max(0, Math.min(n - 1, d.at || 0));
+    const save = (patch, what) => api.write(Object.assign({}, d, patch), what);
+    const parts = s => { const k = String(s || "").split(/\n\?\?\?\n?/); return [k[0], k.slice(1).join("\n")]; };
+    const join = (body, notes) => notes.trim() ? body.trimEnd() + "\n???\n" + notes.trim() : body;
+    const [body, notes] = parts(slides[at] || "");
+    const list = el("ol", { class: "ke-slides" }, ...slides.map((s, i) => el("li", null, el("button", { type: "button", class: i === at ? "on" : "", onclick: ev => { ev.stopPropagation(); save({ at: i }); } }, el("b", null, String(i + 1)), el("span", null, (parts(s)[0].split("\n").find(l => l.trim()) || "Empty").replace(/^#+\s*/, "").slice(0, 40))))));
+    const preview = el("div", { class: "ke-preview ks-stage" }, mdRender(body || " "));
+    const text = kin(body, v => { slides[at] = join(v, notes); save({ slides }, `rewrote slide ${at + 1}`); }, { long: true, rows: 8, placeholder: "# A title\nA line under it\n\n- a point\n- another", code: true, label: `Slide ${at + 1}` });
+    text.addEventListener("input", () => preview.replaceChildren(mdRender(text.value || " ")));
+    const notesIn = kin(notes, v => { slides[at] = join(body, v); save({ slides }, `wrote notes for slide ${at + 1}`); }, { long: true, rows: 2, placeholder: "Speaker notes (only you see these)", cls: "soft" });
+    return kedit(el("div", { class: "ke-deck" }, el("div", { class: "ke-side" }, list, kbtn("+ Slide", "ghost", () => { slides.splice(at + 1, 0, "## New slide\n- A point"); save({ slides, at: at + 1 }, "added a slide"); })),
+      el("div", { class: "ke-main" }, el("div", { class: "ke-bar" }, el("span", { class: "ke-label" }, `Slide ${at + 1} of ${n || 1}`), el("span", { class: "grow" }),
+        kicon("←", "Move slide earlier", () => save({ slides: kmove(slides, at, -1), at: at - 1 }, `moved slide ${at + 1} earlier`), at === 0),
+        kicon("→", "Move slide later", () => save({ slides: kmove(slides, at, 1), at: at + 1 }, `moved slide ${at + 1} later`), at >= n - 1),
+        kicon("⧉", "Duplicate slide", () => { slides.splice(at + 1, 0, slides[at] || ""); save({ slides, at: at + 1 }, `duplicated slide ${at + 1}`); }),
+        kicon("×", "Delete slide", () => { if (n < 2) return; slides.splice(at, 1); save({ slides, at: Math.max(0, at - 1) }, `deleted slide ${at + 1}`); }, n < 2)),
+        preview, text, notesIn)));
+  },
+  site(d, api) {
+    const md = String(d.md || ""), preview = el("div", { class: "ke-preview ke-site" }), draw = v => { preview.replaceChildren(KIT_VIEWS.site({ md: v }, { preview: true }).firstChild || el("span")); };
+    const text = kin(md, v => api.write(Object.assign({}, d, { md: v }), "rewrote the website"), { long: true, rows: 14, code: true, placeholder: "# Big headline\nA line under it.\n\n[A button](https://…)\n\n## A section\nText for it.", label: "Website text" });
+    text.addEventListener("input", () => draw(text.value)); draw(md);
+    return kedit(el("div", { class: "ke-split" }, el("div", null, klabel("Text · # headline · ## section · [Button](link)"), text), el("div", null, klabel("Preview"), preview)));
+  },
+};
+
+const KIT_VIEWS = {
+  quiz(d, api) {
+    if (api.editing) return KIT_EDIT.quiz(d, api);
+    // with people: each person answers for themselves (answers kept by question and option text), scores side by side
+    const P = api.people, qs = d.questions || [];
+    // answers are kept by question and option text; a reworded question or option still finds its answer
+    const pickOf = (m, q) => { if (!m || typeof m !== "object") return -1; const texts = qs.map(x => x.q), keys = Object.keys(m).filter(k => k !== "__proto__" && !texts.includes(k)), key = Object.prototype.hasOwnProperty.call(m, q.q) ? q.q : T.closest(q.q, keys); /* only answers to questions that no longer exist are matched loosely */ if (key == null) return -1; const o = String(m[key]), opts = q.options || []; const k = opts.indexOf(o); return k >= 0 ? k : opts.indexOf(T.closest(o, opts)); };
+    const fromTexts = m => { const a = {}; qs.forEach((q, i) => { const k = pickOf(m, q); if (k >= 0) a[i] = k; }); return a; };
+    const ans = P ? (P.mine && typeof P.mine === "object" ? fromTexts(P.mine) : P.mine === undefined && !P.all.length && P.owner ? d.answers || {} : {}) : d.answers || {};
+    const done = qs.filter((q, i) => ans[i] !== undefined).length, right = qs.filter((q, i) => ans[i] !== undefined && ans[i] === q.answer).length;
+    const answer = (i, j, what) => { if (P) { const m = Object.assign({}, P.mine && typeof P.mine === "object" ? P.mine : {}); m[qs[i].q] = qs[i].options[j]; P.set(m, what); } else api.write(Object.assign({}, d, { answers: Object.assign({}, ans, { [i]: j }) }), what); };
+    const root = el("div", { class: "k k-quiz" });
+    if (!qs.length) return root.appendChild(kempty(api.preview ? "Questions appear here." : "No questions yet. Press Edit to add some.")) && root;
+    root.append(el("div", { class: "k-stats" }, kstat(P ? "Your score" : "Score", `${right} / ${qs.length}`, done === qs.length ? "accent" : ""), kstat("Answered", `${done} / ${qs.length}`)));
+    const others = P ? P.all.filter(m => !m.isMe && m.v && typeof m.v === "object" && Object.keys(m.v).length) : [];
+    if (others.length) root.append(el("div", { class: "k-people" }, ...others.map(m => { const a = fromTexts(m.v), n = qs.filter((q, i) => a[i] !== undefined).length, r = qs.filter((q, i) => a[i] !== undefined && a[i] === q.answer).length; return el("span", { class: "k-person", title: `${personName(m.id)}: ${n} of ${qs.length} answered, ${r} right` }, faces([m.id], 1), el("span", null, personName(m.id)), el("b", null, `${r}/${qs.length}`)); })));
+    qs.forEach((q, i) => {
+      const a = ans[i], card = el("section", { class: "kq" + (a !== undefined ? " answered" : "") }, el("div", { class: "kq-h" }, el("span", { class: "kq-n" }, String(i + 1).padStart(2, "0")), el("b", null, q.q)));
+      const opts = el("div", { class: "kq-opts" });
+      (q.options || []).forEach((o, j) => {
+        const state = a === undefined ? "" : j === q.answer ? " right" : j === a ? " wrong" : " dim";
+        const b = el("button", { type: "button", class: "kq-opt" + state, disabled: a !== undefined || api.preview ? true : null }, el("i"), el("span", null, o));
+        // once you have answered, you see who else picked what
+        if (a !== undefined && others.length) { const who = others.filter(m => pickOf(m.v, q) === j).map(m => m.id); if (who.length) b.append(el("span", { class: "k-tally" }, faces(who, 3))); }
+        if (a === undefined && !api.preview) b.addEventListener("click", ev => { ev.stopPropagation(); answer(i, j, `answered question ${i + 1} (“${q.q}”): ${o}${q.answer >= 0 ? (j === q.answer ? ", right" : ", wrong") : ""}`); });
+        opts.append(b);
+      });
+      card.append(opts); if (a !== undefined && q.why) card.append(el("p", { class: "kq-why" }, q.why));
+      root.append(card);
+    });
+    if (!api.preview) root.append(el("div", { class: "k-actions" },
+      kbtn("Send results to Claude", "primary", () => api.claude("Here are my quiz results", Object.assign({ score: `${right}/${qs.length}`, answered: done, missed: qs.filter((q, i) => ans[i] !== undefined && ans[i] !== q.answer).map(q => q.q).slice(0, 20) }, others.length ? { others: others.length } : {}))),
+      done ? kbtn("Start again", "ghost", () => { if (P) P.set({}, "started the quiz again"); else api.write(Object.assign({}, d, { answers: {} }), "started the quiz again"); }) : null));
+    return root;
+  },
+  poll(d, api) {
+    if (api.editing) return KIT_EDIT.poll(d, api);
+    // with people: each person's pick is theirs (kept by option text), and everyone sees the tally
+    const P = api.people, opts = d.options || [], root = el("div", { class: "k k-poll" + (P ? " multiplayer" : "") });
+    // marks keep the option's text; when an option was reworded since, the closest one takes its votes
+    const fit = list => { const out = []; for (const t of Array.isArray(list) ? list : []) { const o = opts.includes(t) ? t : T.closest(String(t), opts); if (o != null && !out.includes(o)) out.push(o); } return d.multi ? out : out.slice(0, 1); };
+    const legacy = () => (d.picked || []).map(i => opts[i]).filter(o => o != null);
+    const mineTexts = P ? (Array.isArray(P.mine) ? fit(P.mine) : P.mine === undefined && !P.all.length && P.owner ? legacy() : []) : legacy();
+    const picked = opts.map((o, j) => mineTexts.includes(o) ? j : -1).filter(j => j >= 0);
+    const ballots = P ? P.all.map(m => Object.assign({}, m, { v: fit(m.v) })).filter(m => m.v.length) : [];
+    const voters = o => ballots.filter(m => m.v.includes(o)), total = ballots.length;
+    const pick = (next, what) => { const texts = next.map(i => opts[i]); if (P) P.set(texts, what); else api.write(Object.assign({}, d, { picked: next }), what); };
+    if (d.question) root.append(el("div", { class: "k-q" }, d.question));
+    const list = el("div", { class: "k-opts" });
+    opts.forEach((o, j) => {
+      const on = picked.includes(j), vs = voters(o), b = el("button", { type: "button", class: "k-opt" + (on ? " on" : "") + (d.multi ? " multi" : ""), role: d.multi ? "checkbox" : "radio", "aria-checked": String(on), disabled: api.preview ? true : null }, el("i"), el("span", null, o));
+      if (P && total) { b.style.setProperty("--share", (vs.length / total * 100).toFixed(1) + "%"); b.classList.add("tallied"); b.append(el("span", { class: "k-tally" }, faces(vs.map(m => m.id), 4), el("b", null, String(vs.length)))); }
+      if (!api.preview) b.addEventListener("click", ev => { ev.stopPropagation(); const next = d.multi ? (on ? picked.filter(x => x !== j) : picked.concat(j).sort((a, b) => a - b)) : (on ? [] : [j]); pick(next, on ? `unpicked “${o}”` : `picked “${o}”`); });
+      list.append(b);
+    });
+    if (!opts.length) list.append(kempty("Options appear here."));
+    root.append(list);
+    if (!api.preview) {
+      root.append(el("div", { class: "ke-row k-other" }, kadd("Add an option", v => { const options = opts.concat([v]); api.write(Object.assign({}, d, { options }, P ? {} : { picked: d.multi ? picked.concat(options.length - 1) : [options.length - 1] }), `added “${v}”`); if (P) P.set(d.multi ? mineTexts.concat([v]) : [v], `picked “${v}”`); })));
+      const tally = () => Object.fromEntries(opts.map(o => [o, voters(o).length]));
+      root.append(el("div", { class: "k-actions" }, el("span", { class: "k-hint" }, P && total ? `${total} ${total === 1 ? "person has" : "people have"} voted · ${d.multi ? "pick any" : "pick one"}` : d.multi ? "Pick any" : "Pick one"), kbtn("Send to Claude", "primary" + (picked.length || total ? "" : " off"), () => { if (!picked.length && !total) return; api.claude(d.question || "My pick", Object.assign({ picked: picked.map(i => opts[i]) }, P && total ? { votes: total, tally: tally() } : {})); })));
+    }
+    return root;
+  },
+  form(d, api) {
+    if (api.editing) return KIT_EDIT.form(d, api);
+    // with people: everyone fills in their own copy; the responses show below, one row a person
+    const P = api.people, own = P ? (P.mine && typeof P.mine === "object" ? P.mine : P.mine === undefined && !P.all.length && P.owner ? d.values || {} : {}) : d.values || {};
+    const root = el("div", { class: "k k-form" }), values = Object.assign({}, own);
+    if (d.intro) root.append(el("p", { class: "k-intro" }, d.intro));
+    const put = (vals, what) => { if (P) P.set(vals, what); else api.write(Object.assign({}, d, { values: vals }), what); };
+    let t = null, last = null; const save = () => { clearTimeout(t); t = setTimeout(() => put(Object.assign({}, values), last ? `filled in “${last}”` : undefined), 500); };
+    const inputs = [];
+    for (const f of d.fields || []) {
+      const id = "kf-" + Math.random().toString(36).slice(2, 8); let input;
+      const v = values[f.key];
+      if (f.type === "long") { input = el("textarea", { id, rows: "3" }); input.value = v ?? ""; }
+      else if (f.type === "choice") { input = el("select", { id }, el("option", { value: "" }, "Choose…"), ...(f.options || []).map(o => el("option", { value: o, selected: v === o ? true : null }, o))); }
+      else if (f.type === "yes") { input = el("input", { id, type: "checkbox" }); input.checked = !!v; }
+      else { input = el("input", { id, type: { number: "number", date: "date", email: "email" }[f.type] || "text" }); input.value = v ?? ""; }
+      if (api.preview) input.disabled = true;
+      input.addEventListener("keydown", e => e.stopPropagation());
+      input.addEventListener(f.type === "choice" || f.type === "yes" ? "change" : "input", () => { input.closest(".k-field").classList.remove("bad"); values[f.key] = f.type === "yes" ? input.checked : f.type === "number" ? (input.value === "" ? "" : Number(input.value)) : input.value; last = f.label; save(); });
+      inputs.push([f, input]);
+      root.append(el("label", { class: "k-field" + (f.type === "yes" ? " yes" : ""), for: id }, el("span", null, f.label), input));
+    }
+    if (!(d.fields || []).length) root.append(kempty(api.preview ? "Fields appear here." : "No fields yet. Press Edit to add some."));
+    if (!api.preview) root.append(el("div", { class: "k-actions" }, kbtn("Send to Claude", "primary", () => {
+      // an email that is not one, a number that is not one: say so at the field instead of sending it
+      const bad = inputs.filter(([f, i]) => i.value && i.validity && !i.validity.valid); inputs.forEach(([, i]) => i.closest(".k-field").classList.toggle("bad", bad.some(([, j]) => j === i)));
+      if (bad.length) { bad[0][1].focus(); return; }
+      const out = {}; for (const f of d.fields || []) if (values[f.key] !== undefined && values[f.key] !== "") out[f.label] = values[f.key]; clearTimeout(t); put(Object.assign({}, values), "sent the form"); api.claude("Here is the form", P && responses.length > 1 ? Object.assign(out, { responses: responses.length }) : out);
+    }), kbtn("Clear", "ghost", () => put({}, "cleared the form"))));
+    // everyone's answers, side by side
+    const responses = P ? P.all.filter(m => m.v && typeof m.v === "object" && Object.values(m.v).some(x => x !== "" && x !== undefined && x !== false)) : [];
+    if (P && (responses.length > 1 || responses.some(m => !m.isMe))) {
+      const fields = (d.fields || []).slice(0, 8), show = v => v === true ? "Yes" : v === false ? "No" : String(v ?? "");
+      root.append(el("details", { class: "k-responses", open: api.state && api.state.respOpen ? true : null, ontoggle: e => { if (api.state) api.state.respOpen = e.target.open; } },
+        el("summary", null, `Responses · ${responses.length}`),
+        el("div", { class: "kr-scroll" }, el("table", { class: "kr-table" }, el("thead", null, el("tr", null, el("th", null, "Person"), ...fields.map(f => el("th", null, f.label)))),
+          el("tbody", null, ...responses.map(m => el("tr", null, el("td", null, el("span", { class: "k-person" }, faces([m.id], 1), el("span", null, personName(m.id)))), ...fields.map(f => el("td", null, show(m.v[f.key]))))))))));
+    }
+    return root;
+  },
+  chart(d, api) {
+    if (api.editing) return KIT_EDIT.chart(d, api);
+    const cols = d.cols || [], rows = (d.rows || []).filter(r => Array.isArray(r) && r.length), root = el("div", { class: "k k-chart" });
+    const series = cols.slice(1).map((name, k) => ({ name, k: k + 1 })).filter(s => rows.some(r => !isNaN(Number(r[s.k])) && r[s.k] !== ""));
+    if (!rows.length || !series.length) return root.appendChild(kempty(api.preview ? "The chart draws as the numbers arrive." : "No numbers yet. Press Edit to type some in.")) && root;
+    const W = 560, H = 270, L = 44, R = 12, Tp = series.length > 1 ? 30 : 14, B = 30, iw = W - L - R, ih = H - Tp - B;
+    const vals = rows.flatMap(r => series.map(s => Number(r[s.k]) || 0)), max0 = Math.max(0, ...vals), min0 = Math.min(0, ...vals);
+    const step = (() => { const raw = (max0 - min0) / 4 || 1, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; })();
+    const top = Math.ceil(max0 / step) * step || step, bot = Math.floor(min0 / step) * step, y = v => Tp + ih - (v - bot) / (top - bot) * ih;
+    const tip = (r, s) => `<title>${mdEsc(String(r[0] ?? ""))} · ${mdEsc(s.name)}: ${fmtCell(Number(r[s.k]) || 0)}</title>`;
+    let svg = `<svg viewBox="0 0 ${W} ${H}" class="k-svg" role="img" aria-label="${mdEsc(cols.slice(1).join(", "))} by ${mdEsc(cols[0] || "")}">`;
+    for (let v = bot; v <= top + 1e-9; v += step) svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" class="gl${v === 0 ? " zero" : ""}"/><text x="${L - 6}" y="${y(v) + 3.5}" text-anchor="end" class="ax">${fmtCell(Math.round(v * 1e6) / 1e6)}</text>`;
+    const gw = iw / rows.length;
+    rows.forEach((r, i) => { const label = String(r[0] ?? ""); if (rows.length <= 16 || i % Math.ceil(rows.length / 12) === 0) svg += `<text x="${L + gw * i + gw / 2}" y="${H - 10}" text-anchor="middle" class="ax">${mdEsc(label.length > 12 ? label.slice(0, 11) + "…" : label)}</text>`; });
+    if (d.kind === "line") {
+      series.forEach((s, k) => { const pts = rows.map((r, i) => [L + gw * i + gw / 2, y(Number(r[s.k]) || 0)]); svg += `<polyline points="${pts.map(p => p.join(",")).join(" ")}" fill="none" stroke="${SERIES[k % SERIES.length]}" stroke-width="2"/>` + pts.map((p, i) => `<circle cx="${p[0]}" cy="${p[1]}" r="${i === pts.length - 1 ? 4 : 2.5}" fill="${SERIES[k % SERIES.length]}" class="pt">${tip(rows[i], s)}</circle><circle cx="${p[0]}" cy="${p[1]}" r="10" fill="transparent">${tip(rows[i], s)}</circle>`).join(""); });
+    } else {
+      const bw = Math.max(3, Math.min(42, (gw * 0.72) / series.length));
+      rows.forEach((r, i) => series.forEach((s, k) => { const v = Number(r[s.k]) || 0, x = L + gw * i + gw / 2 - (bw * series.length) / 2 + k * bw, y0 = y(Math.max(0, v)), h = Math.abs(y(v) - y(0)); svg += `<rect x="${x + 0.5}" y="${y0}" width="${bw - 1}" height="${Math.max(1, h)}" fill="${SERIES[k % SERIES.length]}" class="bar">${tip(r, s)}</rect>`; if (series.length === 1 && rows.length <= 10) svg += `<text x="${x + bw / 2}" y="${y0 - 5}" text-anchor="middle" class="vl">${fmtCell(v)}</text>`; }));
+    }
+    if (series.length > 1) svg += series.map((s, k) => `<rect x="${L + k * 120}" y="6" width="10" height="10" fill="${SERIES[k % SERIES.length]}"/><text x="${L + 16 + k * 120}" y="15" class="lg">${mdEsc(s.name)}</text>`).join("");
+    root.innerHTML = svg + "</svg>";
+    const last = rows[rows.length - 1], first = rows[0], s0 = series[0], change = Number(last[s0.k]) - Number(first[s0.k]);
+    root.append(el("div", { class: "k-stats" }, kstat(s0.name, fmtCell(Number(last[s0.k]))), kstat("Change", (change > 0 ? "+" : "") + fmtCell(change), change > 0 ? "positive" : change < 0 ? "danger" : ""), kstat("Rows", String(rows.length))));
+    return root;
+  },
+  board(d, api) {
+    if (api.editing) return KIT_EDIT.board(d, api);
+    const cols = d.columns || [], items = d.items || [], root = el("div", { class: "k k-board" });
+    root.style.setProperty("--cols", String(Math.max(1, cols.length) + (api.preview ? 0 : 0)));
+    const save = (patch, what) => api.write(Object.assign({}, d, patch), what);
+    const move = (idx, col) => { const next = items.slice(); next[idx] = Object.assign({}, next[idx], { column: col }); save({ items: next }, `moved “${items[idx].text}” to ${col}`); };
+    cols.forEach((c, ci) => {
+      const mine = items.map((it, idx) => [it, idx]).filter(([it]) => it.column === c);
+      const name = el("span", null, c);
+      if (!api.preview) kinline(name, c, v => { if (!cols.includes(v)) save({ columns: cols.map(x => x === c ? v : x), items: items.map(it => it.column === c ? Object.assign({}, it, { column: v }) : it) }, `renamed the column “${c}” to “${v}”`); });
+      const col = el("section", { class: "kb-col", "data-col": c }, el("header", null, name, el("b", null, String(mine.length))));
+      for (const [it, idx] of mine) {
+        const text = el("span", { class: "kb-text" }, it.text);
+        const card = el("div", { class: "kb-card", draggable: api.preview ? null : "true", tabindex: api.preview ? null : "0" }, text);
+        if (!api.preview) {
+          kinline(text, it.text, v => { const next = items.slice(); next[idx] = Object.assign({}, it, { text: v }); save({ items: next }, `renamed the card “${it.text}” to “${v}”`); });
+          card.addEventListener("dragstart", e => { e.stopPropagation(); e.dataTransfer.setData("text/plain", String(idx)); e.dataTransfer.effectAllowed = "move"; card.classList.add("drag"); });
+          card.addEventListener("dragend", () => card.classList.remove("drag"));
+          card.addEventListener("keydown", e => { if (e.target !== card) return; if (e.key === "ArrowLeft" && ci > 0) { e.stopPropagation(); move(idx, cols[ci - 1]); } if (e.key === "ArrowRight" && ci < cols.length - 1) { e.stopPropagation(); move(idx, cols[ci + 1]); } if (e.key === "Delete" || e.key === "Backspace") { e.stopPropagation(); save({ items: items.filter((_, k) => k !== idx) }, `removed the card “${it.text}”`); } });
+          card.append(el("span", { class: "kb-moves" }, ci > 0 ? kicon("‹", `Move to ${cols[ci - 1]}`, () => move(idx, cols[ci - 1])) : null, ci < cols.length - 1 ? kicon("›", `Move to ${cols[ci + 1]}`, () => move(idx, cols[ci + 1])) : null, kicon("×", "Remove card", () => save({ items: items.filter((_, k) => k !== idx) }, `removed the card “${it.text}”`))));
+        }
+        col.append(card);
+      }
+      if (!mine.length) col.append(el("div", { class: "kb-empty" }, api.preview ? "" : "Drop cards here"));
+      if (!api.preview) {
+        col.addEventListener("dragover", e => { e.preventDefault(); col.classList.add("over"); });
+        col.addEventListener("dragleave", () => col.classList.remove("over"));
+        col.addEventListener("drop", e => { e.preventDefault(); col.classList.remove("over"); const idx = Number(e.dataTransfer.getData("text/plain")); if (!isNaN(idx) && items[idx] && items[idx].column !== c) move(idx, c); });
+        col.append(kadd("Add a card", v => save({ items: items.concat([{ text: v, column: c }]) }, `added the card “${v}” to ${c}`), "board-card-" + c));
+      }
+      root.append(col);
+    });
+    if (!api.preview) root.append(el("section", { class: "kb-col kb-newcol" }, kadd("+ Column", v => { if (!cols.includes(v)) save({ columns: cols.concat([v]) }, `added the column “${v}”`); })));
+    return root;
+  },
+  timeline(d, api) {
+    if (api.editing) return KIT_EDIT.timeline(d, api);
+    const items = d.items || [], root = el("div", { class: "k k-timeline" });
+    if (!items.length && api.preview) return root.appendChild(kempty("Steps appear here.")) && root;
+    items.forEach((it, i) => {
+      const row = el("div", { class: "kt" + (it.done ? " done" : "") }, el("span", { class: "kt-when" }, it.when || ""), el("button", { type: "button", class: "kt-dot", role: "checkbox", "aria-checked": String(!!it.done), "aria-label": `${it.text}: done`, disabled: api.preview ? true : null }), el("span", { class: "kt-text" }, it.text));
+      if (!api.preview) row.querySelector(".kt-dot").addEventListener("click", ev => { ev.stopPropagation(); const next = items.slice(); next[i] = Object.assign({}, it, { done: !it.done }); api.write(Object.assign({}, d, { items: next }), it.done ? `reopened “${it.text}”` : `ticked off “${it.text}”`); });
+      root.append(row);
+    });
+    if (!api.preview) root.append(el("div", { class: "kt kt-add" }, el("span", { class: "kt-when" }), el("span", { class: "kt-dot ghost" }), kadd("Add a step, like “Fri: review”", v => { const m = /^(.{1,40}?):\s+(.+)$/.exec(v); api.write(Object.assign({}, d, { items: items.concat([m ? { when: m[1], text: m[2], done: false } : { when: "", text: v, done: false }]) }), `added the step “${v}”`); })));
+    return root;
+  },
+  cards(d, api) {
+    if (api.editing) return KIT_EDIT.cards(d, api);
+    // with people: each person chooses for themselves (by title); everyone sees who chose what
+    const P = api.people, cards = d.cards || [], root = el("div", { class: "k k-cards" });
+    if (!cards.length) return root.appendChild(kempty(api.preview ? "Cards appear here." : "No cards yet. Press Edit to add some.")) && root;
+    const legacyTitle = d.picked != null && cards[d.picked] ? cards[d.picked].title : null;
+    const mine = P ? (typeof P.mine === "string" ? P.mine : P.mine === undefined && !P.all.length && P.owner ? legacyTitle : null) : legacyTitle;
+    cards.forEach((c, i) => {
+      const titles = cards.map(x => x.title), fitT = v => typeof v !== "string" ? null : titles.includes(v) ? v : T.closest(v, titles);
+      const chosen = fitT(mine) === c.title, by = P ? P.all.filter(m => fitT(m.v) === c.title).map(m => m.id) : [];
+      const card = el("article", { class: "kc" + (chosen ? " picked" : "") }, el("h4", null, c.title, by.length ? el("span", { class: "k-tally" }, faces(by, 4), el("b", null, String(by.length))) : null));
+      if ((c.facts || []).length) card.append(el("dl", null, ...c.facts.flatMap(([k, v]) => [el("dt", null, k), el("dd", null, v)])));
+      if (c.body) card.append(mdRender(c.body));
+      if (d.pick && !api.preview) card.append(kbtn(chosen ? "Chosen" : "Choose", chosen ? "primary" : "", () => { if (P) P.set(c.title, `chose “${c.title}”`); else api.write(Object.assign({}, d, { picked: i }), `chose “${c.title}”`); api.claude(`I choose ${c.title}`, { choice: c.title, facts: Object.fromEntries((c.facts || []).slice(0, 20)) }); }));
+      root.append(card);
+    });
+    return root;
+  },
+  slides: (d, api) => deckView(d, api),
+  canvas: (d, api) => canvasView(d, api),
+  records(d, api) {
+    const fields = d.fields || [], recs = d.records || [], root = el("div", { class: "k k-records" });
+    const st = api.state || (api.state = { q: "", sort: null, dir: 1 });
+    const save = (next, what) => api.write(Object.assign({}, d, next), what);
+    const label = r => String(r[fields[0]] ?? "a record");
+    const search = el("input", { type: "search", class: "kr-search", placeholder: `Search ${recs.length} records`, value: st.q, "aria-label": "Search records" });
+    const head = el("div", { class: "kr-bar" }, search, el("span", { class: "k-hint" }, ""), api.preview ? null : kbtn("+ Record", "primary", () => save({ records: recs.concat([Object.assign({ id: "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5) }, Object.fromEntries(fields.map(f => [f, ""])))]) }, "added a record")));
+    root.append(head);
+    if (!fields.length) { root.append(api.preview ? kempty("Records appear here.") : el("div", { class: "k-empty" }, "No fields yet. ", kadd("Name the first field", v => save({ fields: [v] }, `added the field “${v}”`)))); return root; }
+    const table = el("table", { class: "kr-table" }), tbody = el("tbody");
+    const draw = () => {
+      let list = recs.map((r, i) => [r, i]);
+      if (st.q) { const q = st.q.toLowerCase(); list = list.filter(([r]) => fields.some(f => String(r[f] ?? "").toLowerCase().includes(q))); }
+      if (st.sort) list.sort(([a], [b]) => { const x = a[st.sort], y = b[st.sort], nx = Number(x), ny = Number(y); return (!isNaN(nx) && !isNaN(ny) && x !== "" && y !== "" ? nx - ny : String(x ?? "").localeCompare(String(y ?? ""))) * st.dir; });
+      head.querySelector(".k-hint").textContent = st.q ? `${list.length} of ${recs.length}` : `${recs.length} record${recs.length === 1 ? "" : "s"}`;
+      tbody.replaceChildren(...list.map(([r, i]) => {
+        const tr = el("tr", { class: "kr-row" });
+        for (const f of fields) {
+          const v = r[f] ?? "", td = el("td", { class: typeof v === "number" || /^-?\d+(\.\d+)?$/.test(String(v)) ? "n" : null, contenteditable: api.preview ? null : "plaintext-only", spellcheck: "false" }, String(v));
+          if (!api.preview) {
+            td.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); td.blur(); } });
+            td.addEventListener("blur", () => { const t = td.textContent; if (t !== String(v)) { const next = recs.slice(); next[i] = Object.assign({}, r, { [f]: /^-?\d+(\.\d+)?$/.test(t.trim()) ? Number(t) : t }); save({ records: next }, `set ${f} of “${label(r)}” to ${t}`); } });
+          }
+          tr.append(td);
+        }
+        tr.append(el("td", { class: "kr-x" }, api.preview ? null : kicon("×", `Remove ${label(r)}`, () => save({ records: recs.filter((_, k) => k !== i) }, `removed “${label(r)}”`))));
+        return tr;
+      }));
+    };
+    const th = f => {
+      const name = el("span", null, f), cell = el("th", { "aria-sort": st.sort === f ? (st.dir > 0 ? "ascending" : "descending") : null, onclick: ev => { if (ev.target.closest("button") || name.isContentEditable) return; ev.stopPropagation(); st.dir = st.sort === f ? -st.dir : 1; st.sort = f; table.querySelectorAll("th").forEach(x => x.removeAttribute("aria-sort")); cell.setAttribute("aria-sort", st.dir > 0 ? "ascending" : "descending"); draw(); } }, name);
+      if (!api.preview) {
+        kinline(name, f, v => { if (fields.includes(v)) return; save({ fields: fields.map(x => x === f ? v : x), records: recs.map(r => { const o = Object.assign({}, r, { [v]: r[f] }); delete o[f]; return o; }) }, `renamed the field “${f}” to “${v}”`); });
+        cell.append(kicon("×", `Remove the field ${f}`, () => { if (fields.length < 2) return; save({ fields: fields.filter(x => x !== f), records: recs.map(r => { const o = Object.assign({}, r); delete o[f]; return o; }) }, `removed the field “${f}”`); }, fields.length < 2));
+      }
+      return cell;
+    };
+    table.append(el("thead", null, el("tr", null, ...fields.map(th), el("th", { class: "kr-x" }, api.preview ? null : kicon("+", "Add a field", () => { let n = "Field", i = 2; while (fields.includes(n)) n = "Field " + i++; save({ fields: fields.concat([n]) }, `added the field “${n}”`); })))), tbody);
+    search.addEventListener("input", () => { st.q = search.value; draw(); });
+    search.addEventListener("keydown", e => e.stopPropagation());
+    draw(); root.append(el("div", { class: "kr-scroll" }, table));
+    return root;
+  },
+  site(d, api) {
+    if (api.editing) return KIT_EDIT.site(d, api);
+    const root = el("div", { class: "k k-site" }), page = el("div", { class: "ksite" });
+    const md = String(d.md || ""); if (!md.trim()) return root.appendChild(kempty(api.preview ? "The site builds as the text arrives." : "An empty site. Press Edit to write it.")) && root;
+    page.append(mdRender(md));
+    const m = page.querySelector(".md");
+    // the opening heading and its first paragraph are the hero; a paragraph of only links is a row of buttons
+    const h1 = m.querySelector("h1"); if (h1) { const hero = el("header", { class: "ks-hero" }); m.insertBefore(hero, h1); hero.append(h1); let nx = hero.nextElementSibling; while (nx && nx.tagName === "P") { const n2 = nx.nextElementSibling; hero.append(nx); nx = n2; } }
+    m.querySelectorAll("p").forEach(p => { const links = p.querySelectorAll("a"); if (links.length && p.textContent.trim() === [...links].map(a => a.textContent).join("").trim() || links.length && p.textContent.replace(/\s+/g, "") === [...links].map(a => a.textContent.replace(/\s+/g, "")).join("")) p.classList.add("ks-buttons"); });
+    m.querySelectorAll("h2").forEach(h => { const sec = el("section", { class: "ks-sec" }); h.before(sec); let nx = h; while (nx && !(nx !== h && /^H[12]$/.test(nx.tagName))) { const n2 = nx.nextElementSibling; sec.append(nx); nx = n2; } });
+    root.append(page);
+    return root;
+  },
+};
+
+/* ==========================================================================
+   SLIDES · a presentation app: slides down the side, the slide you are on in
+   the middle, edited right on the slide, a layout and a theme, speaker
+   notes, and Present. Each slide stays markdown, as Claude writes it:
+     layout: title | section | two | quote | big   (optional, the first line)
+     # Title / ## Heading / - points / > quote
+     ||            (a line on its own: the second column of a "two" slide)
+     ???           (a line on its own: speaker notes follow)
+   ========================================================================== */
+const DECK_LAYOUTS = [["auto", "Automatic"], ["title", "Title"], ["content", "Title and points"], ["two", "Two columns"], ["section", "Section"], ["quote", "Quote"], ["big", "Big number"]];
+const DECK_TEMPLATES = { auto: "## A new slide\n- A point\n- Another point", content: "## A new slide\n- A point\n- Another point", title: "# A title\nA line under it", section: "# A new section", two: "## Two sides\n- One thing\n||\n- The other thing", quote: "> Something worth saying out loud.\n\nWho said it", big: "# 87%\nof the point, in one number" };
+const DECK_THEMES = [["paper", "Paper"], ["ink", "Ink"], ["clay", "Clay"]];
+function slideParts(s) {
+  let t = String(s || ""), layout = "auto"; const m = /^\s*(?:<!--\s*)?layout:\s*(auto|title|content|two|section|quote|big)\s*(?:-->)?[ \t]*(?:\n|$)/i.exec(t);
+  if (m) { layout = m[1].toLowerCase(); t = t.slice(m[0].length); }
+  const k = t.split(/\n\?\?\?[ \t]*(?:\n|$)/); return { layout, body: k[0].trim(), notes: k.slice(1).join("\n").trim() };
+}
+const slideJoin = p => (p.layout && p.layout !== "auto" ? `layout: ${p.layout}\n` : "") + String(p.body || "").trim() + (String(p.notes || "").trim() ? "\n???\n" + p.notes.trim() : "");
+/* what an automatic slide looks like: a lone # heading is a title slide, a big number is a number slide */
+function slideLayout(p) {
+  if (p.layout && p.layout !== "auto") return p.layout;
+  const lines = p.body.split("\n").filter(l => l.trim());
+  if (/^\|\|\s*$/m.test(p.body)) return "two";
+  if (lines.length && /^>\s/.test(lines[0])) return "quote";
+  if (lines.length && /^#\s+[-+$€£]?[\d.,]+\s*(%|x|k|m|bn)?\s*$/i.test(lines[0])) return "big";
+  if (lines.length && /^#\s/.test(lines[0]) && lines.length <= 3 && !lines.some(l => /^\s*([-*+]|\d+\.)\s/.test(l))) return "title";
+  return "content";
+}
+/* a slide as an element; editable regions call onChange(body) */
+function slideEl(p, theme, o) {
+  o = o || {}; const lay = slideLayout(p);
+  const stage = el("div", { class: `kd-stage theme-${theme || "paper"} lay-${lay}` });
+  const regions = lay === "two" ? p.body.split(/\n\|\|[ \t]*\n?/) : [p.body];
+  const eds = regions.map((r, i) => {
+    if (!o.edit) { const m = mdRender(r); m.classList.add("kd-region"); m.querySelectorAll("i.md-box").forEach(x => x.remove()); return { el: m }; }
+    return richText(r, () => o.onChange(eds.map(e => e.read()).join("\n||\n")), { cls: "kd-region", label: `Slide text${regions.length > 1 ? `, column ${i + 1}` : ""}`, placeholder: i ? "Second column" : lay === "title" ? "# A title" : "Type on the slide. # for a title, - for points", onInput: o.onInput });
+  });
+  if (lay === "two") stage.append(el("div", { class: "kd-cols" }, ...eds.map(e => e.el))); else stage.append(eds[0].el);
+  if (o.num) stage.append(el("span", { class: "kd-num" }, o.num));
+  stage.read = () => eds.map(e => e.read ? e.read() : "").join("\n||\n");
+  return stage;
+}
+function deckView(d, api) {
+  const slides = (d.slides || []).slice(), n = slides.length, theme = d.theme || "paper";
+  if (api.preview) { const root = el("div", { class: "k kd kd-preview" }); if (!n) return root.appendChild(kempty("Slides appear here.")) && root; root.append(slideEl(slideParts(slides[n - 1]), theme, { num: `${n} / ${n}` })); return root; }
+  const at = Math.max(0, Math.min(n - 1, d.at || 0)), st = api.state;
+  // a change made with a button or menu lets go of the text first, so the deck redraws with it
+  const F = () => { const x = api.fresh ? api.fresh() : d; return x && Array.isArray(x.slides) ? x : d; }, FS = () => F().slides.slice();
+  const save = (patch, what, typing) => { if (!typing && root.contains(document.activeElement)) document.activeElement.blur(); api.write(Object.assign({}, F(), patch), what); };
+  const cur = n ? slideParts(slides[at]) : { layout: "auto", body: "", notes: "" };
+  const setCur = (patch, what, typing) => { const next = FS(); next[at] = slideJoin(Object.assign({}, slideParts(next[at] || ""), patch)); save({ slides: next }, what, typing); };
+  const add = (layout, where) => { const next = FS(), i = where == null ? at + 1 : where; next.splice(i, 0, slideJoin({ layout: layout === "auto" || layout === "content" ? "auto" : layout, body: DECK_TEMPLATES[layout] || DECK_TEMPLATES.auto, notes: "" })); save({ slides: next, at: i }, `added a slide${layout !== "auto" ? ` (${(DECK_LAYOUTS.find(x => x[0] === layout) || [, layout])[1].toLowerCase()})` : ""}`); };
+  const go = k => { k = Math.max(0, Math.min(n - 1, k)); if (k !== at) save({ at: k }, `went to slide ${k + 1}`); };
+  const root = el("div", { class: "k kd", tabindex: "0", "aria-label": "Presentation" });
+  /* toolbar */
+  const newSel = el("select", { class: "kd-new", "aria-label": "New slide", onpointerdown: e => e.stopPropagation(), onchange: e => { const v = e.target.value; e.target.value = ""; e.target.blur(); if (v) add(v); } }, el("option", { value: "" }, "+ Slide"), ...DECK_LAYOUTS.filter(([k]) => k !== "auto").map(([k, l]) => el("option", { value: k }, l)));
+  const laySel = el("select", { class: "kd-lay", "aria-label": "Layout of this slide", onpointerdown: e => e.stopPropagation(), onchange: e => { e.target.blur(); const v = e.target.value, body = cur.body; let nb = body; const L = slideLayout(Object.assign({}, cur, { layout: v }));
+    if (L === "two" && !/^\|\|\s*$/m.test(body)) nb = body + "\n||\n- The other side"; if (L === "quote" && !/^>/m.test(body)) nb = "> " + body.replace(/^#+\s*/gm, "").split("\n")[0] + "\n\n" + body.split("\n").slice(1).join("\n"); if (L === "big" && !/^#\s/m.test(body)) nb = "# 42%\n" + body; if (L !== "two") nb = nb.replace(/\n\|\|[ \t]*\n?/g, "\n");
+    setCur({ layout: v, body: nb.trim() }, `made slide ${at + 1} a ${(DECK_LAYOUTS.find(x => x[0] === v) || [, v])[1].toLowerCase()} slide`); } }, ...DECK_LAYOUTS.map(([k, l]) => el("option", { value: k, selected: cur.layout === k || (k === "auto" && !DECK_LAYOUTS.some(x => x[0] === cur.layout)) ? true : null }, l)));
+  const themes = el("div", { class: "kd-themes", role: "radiogroup", "aria-label": "Theme" }, ...DECK_THEMES.map(([k, l]) => el("button", { type: "button", role: "radio", class: "kd-sw sw-" + k, "aria-checked": String(theme === k), "aria-label": `${l} theme`, "data-tip": l, onclick: ev => { ev.stopPropagation(); save({ theme: k }, `chose the ${l} theme`); } })));
+  const showNotes = st.notes !== false;
+  const present = () => deckPresent(F(), at, k => { if (k !== at) save({ at: k }); });
+  const bar = el("div", { class: "kd-bar tb", role: "toolbar", "aria-label": "Presentation" }, newSel, el("span", { class: "kv-sep" }), ibtn("layout", "Layout", () => laySel.focus()), laySel, el("span", { class: "kv-sep" }), themes, el("span", { class: "grow" }),
+    (() => { const b = ibtn("notes", showNotes ? "Hide speaker notes" : "Show speaker notes", () => { st.notes = !showNotes; rerender(); }); b.setAttribute("aria-pressed", String(showNotes)); return b; })(),
+    el("button", { type: "button", class: "btn sm primary kd-play", onclick: ev => { ev.stopPropagation(); present(); } }, svgIcon("play", 12), "Present"));
+  /* the rail of slides */
+  const rail = el("ol", { class: "kd-rail", "aria-label": "Slides" });
+  slides.forEach((s, i) => {
+    const p = slideParts(s), th = el("li", { class: "kd-thumb" + (i === at ? " on" : ""), draggable: "true", "data-i": String(i) },
+      el("span", { class: "kd-tn" }, String(i + 1)), el("button", { type: "button", class: "kd-tb", "aria-label": `Slide ${i + 1}`, onclick: ev => { ev.stopPropagation(); go(i); } }, slideEl(p, theme)),
+      el("span", { class: "kd-tt" }, kicon("⧉", "Duplicate slide", () => { const next = FS(); next.splice(i + 1, 0, next[i]); save({ slides: next, at: i + 1 }, `duplicated slide ${i + 1}`); }), kicon("×", "Delete slide", () => { if (n < 2) return; const next = FS().filter((_, k) => k !== i); save({ slides: next, at: Math.min(at > i ? at - 1 : at, next.length - 1) }, `deleted slide ${i + 1}`); }, n < 2)));
+    th.addEventListener("dragstart", e => { e.stopPropagation(); e.dataTransfer.setData("text/x-slide", String(i)); e.dataTransfer.effectAllowed = "move"; th.classList.add("drag"); });
+    th.addEventListener("dragend", () => th.classList.remove("drag"));
+    th.addEventListener("dragover", e => { if ([...e.dataTransfer.types].includes("text/x-slide")) { e.preventDefault(); th.classList.add("over"); } });
+    th.addEventListener("dragleave", () => th.classList.remove("over"));
+    th.addEventListener("drop", e => { e.preventDefault(); th.classList.remove("over"); const from = Number(e.dataTransfer.getData("text/x-slide")); if (isNaN(from) || from === i) return; const next = FS(), [x] = next.splice(from, 1); next.splice(i, 0, x); save({ slides: next, at: i }, `moved slide ${from + 1} to ${i + 1}`); });
+    rail.append(th);
+  });
+  rail.append(el("li", { class: "kd-addrow" }, el("button", { type: "button", class: "kd-add", onclick: ev => { ev.stopPropagation(); add("auto", n); } }, svgIcon("plus", 14), "Slide")));
+  /* the slide you are on, edited in place */
+  let stage = null;
+  if (n) stage = slideEl(cur, theme, { edit: true, num: `${at + 1} / ${n}`, onChange: body => setCur({ body }, `edited slide ${at + 1}`, true), onInput: () => { const t = rail.querySelector(`.kd-thumb[data-i="${at}"] .kd-tb`); if (t && stage) t.replaceChildren(slideEl(Object.assign({}, cur, { body: stage.read() }), theme)); } });
+  const notes = el("textarea", { class: "kd-notes", rows: "3", placeholder: "Speaker notes: only you see them while presenting", "aria-label": "Speaker notes" }); notes.value = cur.notes;
+  notes.addEventListener("keydown", e => e.stopPropagation()); notes.addEventListener("pointerdown", e => e.stopPropagation());
+  notes.addEventListener("change", () => setCur({ notes: notes.value }, `wrote notes for slide ${at + 1}`));
+  const nav = el("div", { class: "kd-nav" }, kicon("‹", "Previous slide", () => go(at - 1), at === 0), el("span", null, n ? `${at + 1} / ${n}` : "0 / 0"), kicon("›", "Next slide", () => go(at + 1), at >= n - 1));
+  const center = el("div", { class: "kd-center" }, el("div", { class: "kd-stagewrap" }, stage || el("div", { class: "k-empty" }, "No slides yet. Add one from + Slide.")), nav, showNotes && n ? notes : null);
+  root.append(bar, el("div", { class: "kd-main" }, rail, center));
+  root.addEventListener("keydown", e => {
+    if (e.target.closest("[contenteditable], textarea, input, select")) return;
+    if (["ArrowRight", "ArrowDown", "PageDown"].includes(e.key)) { e.preventDefault(); e.stopPropagation(); go(at + 1); }
+    if (["ArrowLeft", "ArrowUp", "PageUp"].includes(e.key)) { e.preventDefault(); e.stopPropagation(); go(at - 1); }
+  });
+  const rerender = () => { const next = deckView(d, api); if (root.dataset.node) next.dataset.node = root.dataset.node; root.replaceWith(next); };
+  requestAnimationFrame(() => { const t = rail.querySelector(".kd-thumb.on"); if (t && t.scrollIntoViewIfNeeded) t.scrollIntoViewIfNeeded(false); });
+  return root;
+}
+/* Present: the deck fills the screen; arrows, space and clicks move on, Esc ends */
+function deckPresent(d, start, onMove) {
+  const slides = d.slides || [], n = slides.length; if (!n) return;
+  let i = Math.max(0, Math.min(n - 1, start));
+  const box = el("div", { class: "kd-present", tabindex: "0", role: "dialog", "aria-label": "Presenting" }), slot = el("div", { class: "kd-pslot" }), hint = el("div", { class: "kd-phint" });
+  const show = () => { slot.replaceChildren(slideEl(slideParts(slides[i]), d.theme, { num: `${i + 1} / ${n}` })); hint.textContent = "← → to move · Esc to end"; onMove && onMove(i); };
+  const end = () => { document.removeEventListener("keydown", key, true); box.remove(); try { if (document.fullscreenElement) document.exitFullscreen(); } catch (e) {} };
+  const key = e => { e.stopPropagation(); if (["ArrowRight", "ArrowDown", " ", "PageDown", "Enter"].includes(e.key)) { e.preventDefault(); if (i < n - 1) { i++; show(); } } else if (["ArrowLeft", "ArrowUp", "PageUp", "Backspace"].includes(e.key)) { e.preventDefault(); if (i > 0) { i--; show(); } } else if (e.key === "Escape") { e.preventDefault(); end(); } };
+  box.addEventListener("click", e => { if (e.clientX < innerWidth / 4) { if (i > 0) { i--; show(); } } else if (i < n - 1) { i++; show(); } else end(); });
+  document.addEventListener("keydown", key, true);
+  box.append(slot, hint); document.body.append(box); show(); box.focus();
+  try { box.requestFullscreen && box.requestFullscreen().catch(() => {}); } catch (e) {}
+  document.addEventListener("fullscreenchange", function fc() { if (!document.fullscreenElement && box.isConnected && box.dataset.fs) end(); if (document.fullscreenElement === box) box.dataset.fs = "1"; else document.removeEventListener("fullscreenchange", fc); });
+}
+
+/* ==========================================================================
+   CANVAS · a whiteboard you work in directly, like any drawing app.
+   Tools: Select (V), Box (B), Pill (P), Circle (O), Decision (D), Note (N),
+   Arrow (A). Click empty space with a shape tool to place one and type its
+   name; drag the dot on a shape's edge to another shape to connect them (or
+   into empty space for a new connected box). Double-click edits a label,
+   Delete removes, arrows nudge, ⌘D duplicates, − + zoom. The content stays
+   the text Claude writes ([Box] (Pill) <Decision?> note: … A -> B: label).
+   ========================================================================== */
+const CANVAS_TOOLS = [["select", "Select", "V"], ["box", "Box", "B"], ["round", "Pill", "P"], ["circle", "Circle", "O"], ["diamond", "Decision", "D"], ["note", "Note", "N"], ["connect", "Arrow", "A"]];
+const CANVAS_GLYPH = { select: '<path d="M3 2l9 5-4 1.2L6.5 13z" fill="currentColor"/>', box: '<rect x="2.5" y="4" width="11" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/>', round: '<rect x="1.5" y="4.5" width="13" height="7" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.4"/>', circle: '<circle cx="8" cy="8" r="5.3" fill="none" stroke="currentColor" stroke-width="1.4"/>', diamond: '<path d="M8 2.2L13.8 8 8 13.8 2.2 8z" fill="none" stroke="currentColor" stroke-width="1.4"/>', note: '<path d="M3 3h10v7l-3 3H3z" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10 13v-3h3" fill="none" stroke="currentColor" stroke-width="1.4"/>', connect: '<path d="M2.5 12.5L12 3" stroke="currentColor" stroke-width="1.4"/><path d="M7.5 3H12.5V8" fill="none" stroke="currentColor" stroke-width="1.4"/>' };
+const CANVAS_NAME = { box: "Box", round: "Step", circle: "Point", diamond: "Decide?", note: "A note" };
+function canvasView(d, api) {
+  // the data may be hand-written by anyone: numbers are numbers and text is text before any of it reaches markup
+  const num = v => { const x = Number(v); return isFinite(x) ? x : 0; }, SHAPES = ["box", "round", "circle", "diamond", "note"];
+  const nodes = (Array.isArray(d.nodes) ? d.nodes : []).filter(n => n && typeof n === "object").map(n => Object.assign({}, n, { id: String(n.id ?? ""), label: String(n.label ?? ""), shape: SHAPES.includes(n.shape) ? n.shape : "box", x: num(n.x), y: num(n.y), color: typeof n.color === "string" && /^[a-z]{3,8}$/.test(n.color) ? n.color : undefined }));
+  const edges = (Array.isArray(d.edges) ? d.edges : []).filter(e => e && typeof e === "object").map(e => Object.assign({}, e, { from: String(e.from ?? ""), to: String(e.to ?? ""), label: e.label == null ? "" : String(e.label), dashed: e.dashed === true }));
+  const root = el("div", { class: "k k-canvas" + (api.preview ? "" : " live"), tabindex: api.preview ? null : "0", "aria-label": "Canvas" });
+  const st = api.preview ? { tool: "select", sel: null, zoom: 1 } : api.state;
+  if (!api.preview) { if (!st.tool) st.tool = "select"; if (!st.zoom) st.zoom = 1; if (st.sel === undefined) st.sel = null; }
+  const size = n => n.shape === "note" ? [150, 96] : n.shape === "diamond" ? [150, 96] : n.shape === "circle" ? [104, 104] : [160, Math.max(48, 24 + Math.ceil(String(n.label).length / 20) * 18)];
+  const bx = n => { const [w, h] = size(n); return { x: n.x || 0, y: n.y || 0, w, h }; };
+  const byId = id => nodes.find(n => n.id === id);
+  const unique = base => { let v = base, i = 2; const has = x => nodes.some(n => String(n.label).toLowerCase() === x.toLowerCase()); while (has(v)) v = base + " " + i++; return v; };
+  const save = (what, sel) => { if (sel !== undefined) st.sel = sel; api.write(Object.assign({}, d, { nodes: nodes.map(n => Object.assign({}, n)), edges: edges.map(e => Object.assign({}, e)) }), what); };
+  const W = Math.max(640, ...nodes.map(n => bx(n).x + bx(n).w)) + (api.preview ? 32 : 320), H = Math.max(420, ...nodes.map(n => bx(n).y + bx(n).h)) + (api.preview ? 32 : 240);
+  if (!nodes.length && api.preview) return root.appendChild(kempty("Shapes appear here.")) && root;
+  const board = el("div", { class: "kv-board" }); board.style.width = W + "px"; board.style.height = H + "px";
+  const z = () => ((api.zoom && api.zoom()) || 1) * (st.zoom || 1);
+  if (!api.preview) { board.style.transform = `scale(${st.zoom})`; board.style.transformOrigin = "0 0"; }
+  const svgNS = "http://www.w3.org/2000/svg", svg = document.createElementNS(svgNS, "svg"); svg.setAttribute("class", "kv-links"); svg.setAttribute("width", W); svg.setAttribute("height", H);
+  let ghost = null; // the arrow being drawn: { from, x, y }
+  const ends = (A, Bb) => {
+    const ax = A.x + A.w / 2, ay = A.y + A.h / 2, bxc = Bb.x + Bb.w / 2, byc = Bb.y + Bb.h / 2, horiz = Math.abs(bxc - ax) > Math.abs(byc - ay);
+    const p1 = horiz ? [bxc > ax ? A.x + A.w : A.x, ay] : [ax, byc > ay ? A.y + A.h : A.y], p2 = horiz ? [bxc > ax ? Bb.x - 2 : Bb.x + Bb.w + 2, byc] : [bxc, byc > ay ? Bb.y - 2 : Bb.y + Bb.h + 2];
+    const c1 = horiz ? [(p1[0] + p2[0]) / 2, p1[1]] : [p1[0], (p1[1] + p2[1]) / 2], c2 = horiz ? [(p1[0] + p2[0]) / 2, p2[1]] : [p2[0], (p1[1] + p2[1]) / 2];
+    return { p1, p2, c1, c2 };
+  };
+  const draw = () => {
+    let out = `<defs><marker id="kv-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="var(--ink-2)"/></marker><marker id="kv-arrow-on" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 Z" fill="var(--accent)"/></marker></defs>`;
+    edges.forEach((e, i) => {
+      const a = byId(e.from), b = byId(e.to); if (!a || !b) return;
+      const { p1, p2, c1, c2 } = ends(bx(a), bx(b)), on = st.sel && st.sel.edge === i, path = `M${p1} C${c1} ${c2} ${p2}`;
+      out += `<path d="${path}" class="kv-edge${e.dashed ? " dashed" : ""}${on ? " on" : ""}" marker-end="url(#kv-arrow${on ? "-on" : ""})"/>`;
+      if (!api.preview) out += `<path d="${path}" class="kv-hit" data-edge="${i}"><title>${mdEsc(e.label || "Arrow")}: click to select, double-click to label</title></path>`;
+      if (e.label) { const mx = (p1[0] + p2[0]) / 2, my = (p1[1] + p2[1]) / 2, w = e.label.length * 6 + 12; out += `<rect x="${mx - w / 2}" y="${my - 9}" width="${w}" height="18" class="kv-lbg" data-edge="${i}"/><text x="${mx}" y="${my + 4}" text-anchor="middle" class="kv-lbl" data-edge="${i}">${mdEsc(e.label)}</text>`; }
+    });
+    if (ghost) { const a = byId(ghost.from); if (a) { const A = bx(a); out += `<path d="M${A.x + A.w / 2},${A.y + A.h / 2} L${ghost.x},${ghost.y}" class="kv-edge ghost"/>`; } }
+    svg.innerHTML = out;
+  };
+  board.append(svg);
+  const nodeEls = new Map();
+  /* where a pointer is, in board coordinates */
+  const at = ev => { const r = board.getBoundingClientRect(), k = r.width / W || 1; return { x: (ev.clientX - r.left) / k, y: (ev.clientY - r.top) / k }; };
+  const hitNode = (x, y) => nodes.slice().reverse().find(n => { const b = bx(n); return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h; });
+  const addNode = (shape, x, y, label) => { const [w, h] = size({ shape, label: "" }); const n = { id: "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 4), label: unique(label || CANVAS_NAME[shape] || "Box"), shape, x: Math.max(0, Math.round(x - w / 2)), y: Math.max(0, Math.round(y - h / 2)) }; if (shape === "note") n.color = "yellow"; nodes.push(n); return n; };
+  const connect = (from, to, what) => { if (from === to || edges.some(e => e.from === from && e.to === to)) return false; edges.push({ from, to, label: "", dashed: false }); return true; };
+  const editLabel = (n) => {
+    const e = nodeEls.get(n.id); if (!e) return; const span = e.querySelector("span");
+    span.contentEditable = "plaintext-only"; span.spellcheck = false; span.focus(); const r = document.createRange(); r.selectNodeContents(span); const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+    let done = false; const finish = keep => { if (done) return; done = true; span.contentEditable = "false"; const v = span.textContent.trim().replace(/[\[\]<>()]/g, ""); if (keep && v && v !== n.label) { n.label = nodes.some(m => m !== n && m.label.toLowerCase() === v.toLowerCase()) ? unique(v) : v; save(`renamed a shape to “${n.label}”`, { node: n.id }); } else span.textContent = n.label; root.focus({ preventScroll: true }); };
+    span.addEventListener("blur", () => finish(true), { once: true });
+    span.addEventListener("keydown", e2 => { e2.stopPropagation(); if (e2.key === "Enter" && !e2.shiftKey) { e2.preventDefault(); span.blur(); } if (e2.key === "Escape") { finish(false); } });
+  };
+  const editEdge = i => {
+    const e = edges[i], a = byId(e.from), b = byId(e.to); if (!a || !b) return; const { p1, p2 } = ends(bx(a), bx(b));
+    const inp = el("input", { type: "text", class: "kv-elabel", value: e.label || "", placeholder: "Label", "aria-label": "Arrow label" });
+    inp.style.left = ((p1[0] + p2[0]) / 2 - 60) + "px"; inp.style.top = ((p1[1] + p2[1]) / 2 - 13) + "px"; board.append(inp); inp.focus(); inp.select();
+    let done = false; const finish = keep => { if (done) return; done = true; inp.remove(); if (keep && inp.value.trim() !== (e.label || "")) { e.label = inp.value.trim().replace(/[:>]/g, ""); save(e.label ? `labelled an arrow “${e.label}”` : "cleared an arrow's label", { edge: i }); } };
+    inp.addEventListener("keydown", k => { k.stopPropagation(); if (k.key === "Enter") finish(true); if (k.key === "Escape") finish(false); });
+    inp.addEventListener("pointerdown", k => k.stopPropagation());
+    inp.addEventListener("blur", () => finish(true));
+  };
+  for (const n of nodes) {
+    const b = bx(n), on = st.sel && st.sel.node === n.id;
+    const e = el("div", { class: "kv-node kv-" + n.shape + (on ? " on" : ""), "data-n": n.id }, el("span", null, n.label));
+    e.style.left = b.x + "px"; e.style.top = b.y + "px"; e.style.width = b.w + "px"; e.style.height = b.h + "px";
+    if (n.color && STICKY[n.color]) { e.style.setProperty("--fill", STICKY[n.color]); e.style.color = "#141413"; }
+    if (!api.preview) e.append(el("i", { class: "kv-port", title: "Drag to another shape to connect", "aria-hidden": "true" }));
+    nodeEls.set(n.id, e); board.append(e);
+  }
+  if (!api.preview) {
+    /* one pointer handler for the whole board: place, select, move, connect */
+    board.addEventListener("pointerdown", ev => {
+      if (ev.button !== 0 || ev.target.closest(".kv-elabel") || ev.target.isContentEditable) return;
+      ev.stopPropagation(); root.focus({ preventScroll: true });
+      const p = at(ev), port = ev.target.closest(".kv-port"), nodeEl = ev.target.closest(".kv-node"), edgeEl = ev.target.closest("[data-edge]");
+      const n = nodeEl ? byId(nodeEl.dataset.n) : null;
+      if (edgeEl && !n && st.tool !== "connect") { st.sel = { edge: Number(edgeEl.dataset.edge) }; rerender(); return; }
+      if ((port && n) || (n && st.tool === "connect")) {
+        ev.preventDefault(); board.setPointerCapture(ev.pointerId); ghost = { from: n.id, x: p.x, y: p.y }; draw();
+        const mv = m => { const q = at(m); ghost.x = q.x; ghost.y = q.y; draw(); const t = hitNode(q.x, q.y); nodeEls.forEach((x, id) => x.classList.toggle("target", !!t && id === t.id && id !== n.id)); };
+        const up = m => { board.removeEventListener("pointermove", mv); board.removeEventListener("pointerup", up); board.removeEventListener("pointercancel", up); const q = at(m), t = hitNode(q.x, q.y); ghost = null;
+          if (m.type === "pointercancel") { draw(); return; }
+          if (t && t.id !== n.id) { if (connect(n.id, t.id)) save(`connected “${n.label}” to “${t.label}”`, { node: t.id }); else draw(); }
+          else if (!t && Math.hypot(q.x - p.x, q.y - p.y) > 24) { const m2 = addNode(n.shape === "note" ? "box" : n.shape, q.x, q.y); connect(n.id, m2.id); st.sel = { node: m2.id, edit: true }; save(`added “${m2.label}” after “${n.label}”`); }
+          else draw(); };
+        board.addEventListener("pointermove", mv); board.addEventListener("pointerup", up); board.addEventListener("pointercancel", up);
+        return;
+      }
+      if (n) {
+        ev.preventDefault(); board.setPointerCapture(ev.pointerId);
+        const e = nodeEls.get(n.id), sx = ev.clientX, sy = ev.clientY, ox = n.x || 0, oy = n.y || 0; let moved = false;
+        if (!(st.sel && st.sel.node === n.id)) { st.sel = { node: n.id }; root.querySelectorAll(".kv-node.on").forEach(x => x.classList.remove("on")); e.classList.add("on"); syncBar(); }
+        const mv = m => { const k = z(), dx = (m.clientX - sx) / k, dy = (m.clientY - sy) / k; if (Math.abs(dx) + Math.abs(dy) > 2) moved = true; if (!moved) return; n.x = Math.max(0, Math.round((ox + dx) / 4) * 4); n.y = Math.max(0, Math.round((oy + dy) / 4) * 4); e.style.left = n.x + "px"; e.style.top = n.y + "px"; draw(); };
+        const up = () => { board.removeEventListener("pointermove", mv); board.removeEventListener("pointerup", up); board.removeEventListener("pointercancel", up); if (moved) save(`moved “${n.label}”`); };
+        board.addEventListener("pointermove", mv); board.addEventListener("pointerup", up); board.addEventListener("pointercancel", up);
+        return;
+      }
+      // empty space: a shape tool places one; Select clears the selection
+      if (st.tool !== "select" && st.tool !== "connect") { const m = addNode(st.tool, p.x, p.y); st.tool = "select"; st.sel = { node: m.id, edit: true }; save(`added the ${CANVAS_NAME[m.shape] ? m.shape === "diamond" ? "decision" : m.shape === "round" ? "step" : m.shape : "shape"} “${m.label}”`); return; }
+      if (st.sel) { st.sel = null; rerender(); }
+    });
+    board.addEventListener("dblclick", ev => {
+      ev.stopPropagation(); if (ev.target.closest(".kv-elabel") || ev.target.isContentEditable) return;
+      const nodeEl = ev.target.closest(".kv-node"), edgeEl = ev.target.closest("[data-edge]");
+      if (nodeEl) { const n = byId(nodeEl.dataset.n); if (n) editLabel(n); return; }
+      if (edgeEl) { editEdge(Number(edgeEl.dataset.edge)); return; }
+      const p = at(ev), m = addNode("box", p.x, p.y); st.sel = { node: m.id, edit: true }; save(`added the box “${m.label}”`);
+    });
+  }
+  /* the toolbar: tools, then what the selection can do, then zoom */
+  const bar = el("div", { class: "kv-bar", role: "toolbar", "aria-label": "Canvas tools" });
+  const selected = () => st.sel && st.sel.node ? byId(st.sel.node) : null, selEdge = () => st.sel && st.sel.edge != null ? edges[st.sel.edge] : null;
+  const remove = () => {
+    const n = selected(), e = selEdge();
+    if (n) { const i = nodes.indexOf(n); nodes.splice(i, 1); for (let k = edges.length - 1; k >= 0; k--) if (edges[k].from === n.id || edges[k].to === n.id) edges.splice(k, 1); save(`deleted “${n.label}”`, null); }
+    else if (e) { edges.splice(st.sel.edge, 1); save("deleted an arrow", null); }
+  };
+  const syncBar = () => {
+    if (api.preview) return;
+    const n = selected(), e = selEdge();
+    bar.replaceChildren(
+      ...CANVAS_TOOLS.map(([k, label, key]) => { const b = el("button", { type: "button", class: "kv-tool", "aria-pressed": String(st.tool === k), "aria-label": `${label} (${key})`, title: `${label} · ${key}`, onclick: ev => { ev.stopPropagation(); st.tool = st.tool === k && k !== "select" ? "select" : k; root.classList.toggle("placing", st.tool !== "select"); syncBar(); root.focus({ preventScroll: true }); } }); b.innerHTML = `<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">${CANVAS_GLYPH[k]}</svg>`; return b; }),
+      el("span", { class: "kv-sep" }),
+      ...(n ? [...Object.keys(STICKY).map(c => el("button", { type: "button", class: "kv-swatch" + (n.color === c ? " on" : ""), style: `--sw:${STICKY[c]}`, "aria-label": `Colour ${c}`, title: c, onclick: ev => { ev.stopPropagation(); n.color = n.color === c && n.shape !== "note" ? undefined : c; save(`coloured “${n.label}” ${c}`); } })),
+        el("select", { class: "kv-shape", "aria-label": "Shape", onpointerdown: ev => ev.stopPropagation(), onchange: ev => { n.shape = ev.target.value; if (n.shape === "note" && !n.color) n.color = "yellow"; save(`made “${n.label}” a ${ev.target.selectedOptions[0].textContent.toLowerCase()}`); } }, ...CANVAS_TOOLS.filter(([k]) => k !== "select" && k !== "connect").map(([k, l]) => el("option", { value: k, selected: n.shape === k ? true : null }, l))),
+        kicon("⧉", "Duplicate (⌘D)", () => { const m = addNode(n.shape, n.x + bx(n).w / 2 + 24, n.y + bx(n).h / 2 + 24, n.label); m.color = n.color; save(`duplicated “${n.label}”`, { node: m.id }); }),
+        kicon("×", "Delete (⌫)", remove)] : []),
+      ...(e ? [kbtn(e.dashed ? "Solid" : "Dashed", "ghost", () => { e.dashed = !e.dashed; save(e.dashed ? "dashed an arrow" : "made an arrow solid"); }), kbtn("Label", "ghost", () => editEdge(st.sel.edge)), kbtn("Reverse", "ghost", () => { [e.from, e.to] = [e.to, e.from]; save("reversed an arrow"); }), kicon("×", "Delete arrow (⌫)", remove)] : []),
+      ...(!n && !e ? [el("span", { class: "kv-hint" }, st.tool === "select" ? (nodes.length ? "Double-click to add a box · drag a shape's dot to connect" : "Pick a shape, then click to place it") : st.tool === "connect" ? "Drag from one shape to another" : "Click to place it")] : []),
+      el("span", { class: "grow" }),
+      kicon("⤢", "Fit everything", () => { const sc = root.querySelector(".kv-scroll"); if (!sc || !nodes.length) return; const mx = Math.max(...nodes.map(n => bx(n).x + bx(n).w)) + 40, my = Math.max(...nodes.map(n => bx(n).y + bx(n).h)) + 40; st.zoom = Math.max(0.4, Math.min(1.5, Math.floor(Math.min(sc.clientWidth / mx, sc.clientHeight / my) * 20) / 20)); st.sx = 0; st.sy = 0; rerender(); }),
+      kicon("−", "Zoom out", () => { st.zoom = Math.max(0.4, Math.round((st.zoom / 1.25) * 100) / 100); rerender(); }),
+      el("button", { type: "button", class: "kv-zoom", title: "Back to 100%", onclick: ev => { ev.stopPropagation(); st.zoom = 1; rerender(); } }, Math.round(st.zoom * 100) + "%"),
+      kicon("+", "Zoom in", () => { st.zoom = Math.min(2.5, Math.round(st.zoom * 1.25 * 100) / 100); rerender(); }));
+  };
+  /* redraw just this view (selection and zoom are the viewer's own, not saved) */
+  const rerender = () => { const next = canvasView(d, api); if (root.dataset.node) next.dataset.node = root.dataset.node; root.replaceWith(next); next.focus({ preventScroll: true }); };
+  if (!api.preview) {
+    root.addEventListener("keydown", ev => {
+      if (ev.target !== root) return;
+      const n = selected(), k = ev.key, mod = ev.metaKey || ev.ctrlKey;
+      const tool = CANVAS_TOOLS.find(t => t[2].toLowerCase() === k.toLowerCase());
+      if (tool && !mod) { ev.stopPropagation(); ev.preventDefault(); st.tool = tool[0]; root.classList.toggle("placing", st.tool !== "select"); syncBar(); return; }
+      if (k === "Delete" || k === "Backspace") { ev.stopPropagation(); ev.preventDefault(); if (st.sel) remove(); return; }
+      if (k === "Enter" && n) { ev.stopPropagation(); ev.preventDefault(); editLabel(n); return; }
+      if (k === "Escape") { ev.stopPropagation(); st.tool = "select"; if (st.sel) { st.sel = null; rerender(); } else syncBar(); return; }
+      if (mod && k.toLowerCase() === "d" && n) { ev.stopPropagation(); ev.preventDefault(); const m = addNode(n.shape, n.x + bx(n).w / 2 + 24, n.y + bx(n).h / 2 + 24, n.label); m.color = n.color; save(`duplicated “${n.label}”`, { node: m.id }); return; }
+      if (k.startsWith("Arrow") && n) { ev.stopPropagation(); ev.preventDefault(); const s = ev.shiftKey ? 1 : 12; n.x = Math.max(0, (n.x || 0) + (k === "ArrowLeft" ? -s : k === "ArrowRight" ? s : 0)); n.y = Math.max(0, (n.y || 0) + (k === "ArrowUp" ? -s : k === "ArrowDown" ? s : 0)); const e = nodeEls.get(n.id); e.style.left = n.x + "px"; e.style.top = n.y + "px"; draw(); clearTimeout(root._nudge); root._nudge = setTimeout(() => save(`moved “${n.label}”`), 500); return; }
+      if ((k === "+" || k === "=") && !mod) { ev.stopPropagation(); st.zoom = Math.min(2.5, st.zoom * 1.25); rerender(); }
+      if (k === "-" && !mod) { ev.stopPropagation(); st.zoom = Math.max(0.4, st.zoom / 1.25); rerender(); }
+    });
+    root.classList.toggle("placing", st.tool !== "select");
+  }
+  draw(); syncBar();
+  const scroller = el("div", { class: "kv-scroll" }, el("div", { class: "kv-size" }, board));
+  if (!api.preview) { scroller.firstChild.style.width = W * st.zoom + "px"; scroller.firstChild.style.height = H * st.zoom + "px"; scroller.addEventListener("scroll", () => { st.sx = scroller.scrollLeft; st.sy = scroller.scrollTop; }); requestAnimationFrame(() => { scroller.scrollLeft = st.sx || 0; scroller.scrollTop = st.sy || 0; }); }
+  if (!api.preview) root.append(bar);
+  root.append(scroller);
+  // a shape just placed asks for its name
+  if (st.sel && st.sel.edit) { const n = selected(); st.sel = { node: st.sel.node }; if (n) requestAnimationFrame(() => editLabel(n)); }
+  return root;
+}
+
+/* Edit as text: a built-in app's content in the block format Claude writes and reads */
+function kitTextEditor(kit, d, api, close) {
+  const K = T.KITS[kit], ta = el("textarea", { spellcheck: "false", "aria-label": `${K.title} as text` }); ta.value = K.encode(d);
+  ta.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Escape") close(); if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) apply(); });
+  ta.addEventListener("pointerdown", e => e.stopPropagation());
+  const apply = () => { const v = T.kitVariant(kit, d), next = T.kitCarry(kit, d, K.parse(ta.value, v), v); if (next.nodes) next.nodes.forEach(n => delete n.auto); api.write(Object.assign({}, d, next), `rewrote the ${K.title.toLowerCase()} as text`); close(); };
+  const help = { quiz: "? question · - option · * right option · > why", poll: "the question, then - options", form: "intro, then - Label: text|long|number|date|email|yes|choice (a, b)", chart: "| Label | Series | … | rows of numbers", board: "## Column, then - cards", timeline: "- when: what · - [x] when: done", cards: "## Title, Key: value lines, then text", slides: "markdown slides between lines of ---, notes after ???", canvas: "[Box] (Pill) ((Circle)) <Decision?> note: text · A -> B: label · A --> B dashed · #colour · @ x,y", records: "| Field | Field | then one row per record", site: "# headline · ## section · [Button](link)" }[kit] || "";
+  setTimeout(() => ta.focus(), 0);
+  return el("div", { class: "k ke-text" }, el("p", null, help), ta, el("div", { class: "k-actions" }, el("span", { class: "k-hint" }, "The same text Claude writes. ⌘/Ctrl + Enter to apply."), kbtn("Cancel", "ghost", close), kbtn("Apply", "primary", apply)));
+}
+
+/* ==========================================================================
+   APP VIEW · renders a compiled program into DOM inside an app frame.
+   Build once per (program, data) change; runtime lambdas update their slots
+   every frame through small updater functions.
+   ========================================================================== */
+class AppView {
+  constructor(desk, appId) { this.desk = desk; this.appId = appId; this.updaters = []; this.sims = new Map(); this.errors = new Map(); this.nodeEls = new Map(); }
+  file() { return Store.files.get(this.appId); }
+  ctx(forAct) {
+    const d = this.desk, c = Object.create(null), notes = d.notesCache, comp = this.compiled, self = this;
+    const params = comp && comp.session.params ? comp.session.params.values : {};
+    Object.assign(c, params, {
+      t: d.t, dt: d.dt, frame: d.frameN, now: Date.now(), zoom: d.cam.z, notes, thoughts: notes, params: Object.assign({}, params),
+      selected: d.sel ? Store.files.get(d.sel) || null : null,
+      count(f) { return f ? notes.filter(t => T.matches(t, f)).length : notes.length; },
+      file(name) { const ref = comp && comp.session.files[name], f = Store.byName(name, ref && ref.type); if (f) return clone(f.content); return ref ? clone(ref.seed) : undefined; },
+      files: Store.list().map(f => ({ id: f.id, name: f.name, type: f.type, placed: !!f.placed, by: f.by, at: f.at, updated: f.updated })),
+      write(name, v) { if (!forAct) throw new Error("c.write() only works inside act(); live() runs every frame and must not change files."); return d.writeFile(name, v, self); },
+      create(name, type, content) { if (!forAct) throw new Error("c.create() only works inside act()."); return d.writeFile(name, content, self, type); },
+      run(name, input) { if (!forAct) throw new Error("c.run() only works inside act()."); const f = Store.byName(name, "program"); if (!f) throw new Error(`No program called “${name}”.`); return d.runner.run(f.id, { by: "you", input }); },
+      // the app's own state, for this viewer only: what is open, which tab, a draft. c.set re-renders live parts.
+      state: self.state || (self.state = {}),
+      set(key, value) { if (!forAct) throw new Error("c.set() only works inside act()."); (self.state || (self.state = {}))[key] = value; return value; },
+      // kept on this device between visits (not shared): preferences, a last search
+      mine: self.mine || (self.mine = (() => { try { return JSON.parse(localStorage.getItem("cc.mine." + self.appId) || "{}"); } catch (e) { return {}; } })()),
+      keep(key, value) { if (!forAct) throw new Error("c.keep() only works inside act()."); self.mine[key] = value; try { localStorage.setItem("cc.mine." + self.appId, JSON.stringify(self.mine)); } catch (e) {} return value; },
+      // records: a small database by name, shared with programs and Claude
+      records(name, query) { return recordsOp(name, "list", query); },
+      add(name, rec) { if (!forAct) throw new Error("c.add() only works inside act()."); return recordsOp(name, "add", rec, null, "you"); },
+      update(name, id, patch) { if (!forAct) throw new Error("c.update() only works inside act()."); return recordsOp(name, "update", id, patch, "you"); },
+      remove(name, id) { if (!forAct) throw new Error("c.remove() only works inside act()."); return recordsOp(name, "remove", id, null, "you"); },
+      // ask the Claude built into this page to make something: an app, a file, a fix
+      make(request) { if (!forAct) throw new Error("c.make() only works inside act()."); return d.o.make ? d.o.make(String(request)) : Promise.reject(new Error("The built-in Claude is not available here.")); },
+      // hand the turn to Claude in the chat: what was said and picked in this app becomes Claude's next message
+      claude(say, data) { if (!forAct) throw new Error("c.claude() only works inside act(): it hands the turn to Claude when someone presses a button."); const app = self.file(); return d.o.toClaude ? d.o.toClaude(say, data, app ? app.name : "an app") : false; },
+      // people: who is using this app, who is here now, and what each of them keeps in it
+      me: d.o.me ? d.o.me() : { id: null, name: "You", color: null, isMe: true },
+      people: d.o.peopleHere ? d.o.peopleHere() : [],
+      person(id) { const p = Store.person(id); return p ? { id: p.id, name: fullName(p.id), color: p.color, avatar: p.avatarUrl, guest: !!p.guest, isMe: p.id === Store.me.id } : null; },
+      // c.my(key) / c.setMy(key, v): one value per person, everyone can read it, only its person can change it
+      my(key) { const sc = myScope(key); return sc ? clone(Store.myMark(sc)) : clone((self.mine || {})["my:" + key]); },
+      everyone(key) { const sc = myScope(key); if (!sc) { const v = (self.mine || {})["my:" + key]; return v === undefined ? [] : [{ id: Store.me.id, name: "You", value: clone(v), at: 0, isMe: true }]; } return Store.marksFor(sc).map(m => ({ id: m.id, name: fullName(m.id), color: (Store.person(m.id) || {}).color, value: clone(m.v), at: m.at, isMe: m.isMe })); },
+      setMy(key, value) { if (!forAct) throw new Error("c.setMy() only works inside act()."); const sc = myScope(key); if (sc) Store.setMark(sc, value === undefined ? null : value); else { self.mine["my:" + key] = value; try { localStorage.setItem("cc.mine." + self.appId, JSON.stringify(self.mine)); } catch (e) {} } return value; },
+    });
+    const myScope = key => { if (typeof key !== "string" || !key) throw new Error("c.my(key) takes a name, like c.my(\"vote\")."); return Store.marksOn() ? Store.markScope("a", self.appId, key) : null; };
+    return c;
+  }
+  val(v, node, slot, args) {
+    if (!(v instanceof T.Live)) return v;
+    try { return args ? v.fn(...args, this.c) : v.fn(this.c); }
+    catch (e) { this.fail(node, slot, v.line, e); return undefined; }
+  }
+  fail(node, slot, line, e) {
+    const key = node.id + ":" + slot;
+    if (!this.errors.has(key)) { this.errors.set(key, { code: "T-RUNTIME", line, node: node.id, severity: "error", message: `${node.type}.${slot}: ${e.message}`, hint: "The lambda threw while running. Check what it reads from c; notes and files can be empty." }); this.desk.o.onAppErrors && this.desk.o.onAppErrors(this.appId); }
+    const elx = this.nodeEls.get(node.id); if (elx) elx.classList.add("rt-err");
+  }
+  runAct(a, node, args) {
+    try { a.fn(...(args || []), this.ctx(true)); }
+    catch (e) { this.fail(node, "act", a.line, e); this.desk.o.toast && this.desk.o.toast(`${node.type}: ${e.message}`); }
+  }
+  render(compiled, body) {
+    this.compiled = compiled; this.updaters = []; this.nodeEls = new Map(); this.links = compiled.session.links;
+    this.c = this.ctx(false);
+    const s = compiled.session, root = el("div", { class: "app-root" }), flow = el("div", { class: "app-flow" });
+    root.append(flow);
+    for (const id of s.space.root.kids) {
+      const n = s.byId[id], e = this.build(n);
+      if (Array.isArray(n.props.at) || n.props.at instanceof T.Live) { e.classList.add("at"); root.append(e); this.updaters.push(() => { const at = this.val(n.props.at, n, "at"); if (Array.isArray(at)) { e.style.left = at[0] + "px"; e.style.top = at[1] + "px"; } }); }
+      else flow.append(e);
+    }
+    if (this.links.length) { this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); this.svg.setAttribute("class", "app-links"); root.append(this.svg); this.updaters.push(() => this.drawLinks(root)); }
+    body.replaceChildren(root); this.root = root;
+    if (!this.entered) { this.entered = true; body.classList.add("k-enter"); root.querySelectorAll(".k-stat, .kq, .k-opt, .kb-card, .kt, .kc, .kv-node, .k-field, .ks-stage, .ks-sec, .ks-hero, .k-svg rect, .k-svg polyline, .kr-row").forEach((e, i) => e.style.setProperty("--i", String(Math.min(i, 18)))); setTimeout(() => body.classList.remove("k-enter"), 1500); }
+    for (const u of this.updaters) try { u(); } catch (e) {}
+    // absolute nodes: grow the root to hold them
+    this.updaters.push(() => { let h = flow.offsetHeight; root.querySelectorAll(":scope > .at").forEach(x => { h = Math.max(h, x.offsetTop + x.offsetHeight); }); root.style.minHeight = h + "px"; });
+  }
+  text(n, slot, e) {
+    const v = n.props[slot];
+    if (v instanceof T.Live) { this.updaters.push(() => { const x = this.val(v, n, slot); const s = x == null ? "" : String(x); if (e.textContent !== s) e.textContent = s; }); }
+    else e.textContent = v == null ? "" : String(v);
+    return e;
+  }
+  tone(n, e) {
+    const P = n.props;
+    if (P.tone instanceof T.Live) this.updaters.push(() => { const t = this.val(P.tone, n, "tone"); e.dataset.tone = t || ""; }); else if (P.tone) e.dataset.tone = P.tone;
+    if (P.dim instanceof T.Live) this.updaters.push(() => { e.classList.toggle("dim", !!this.val(P.dim, n, "dim")); }); else if (P.dim) e.classList.add("dim");
+    if (P.w) e.style.width = P.w + "px"; if (P.h) e.style.minHeight = P.h + "px";
+    return e;
+  }
+  build(n) {
+    const e = this.make(n); if (e) { this.nodeEls.set(n.id, e); e.dataset.node = n.id; } return e;
+  }
+  make(n) {
+    const P = n.props, s = this.compiled.session, kid = id => this.build(s.byId[id]);
+    switch (n.cls) {
+      case "card": {
+        // a bare string in a toolbar or status bar is just text there
+        if (P.auto && n.parent && ["toolbar", "statusbar"].includes((s.byId[n.parent] || {}).type)) return this.text(n, "text", el("span", { class: "l-text" }));
+        const card = noteCard({ kind: n.type, text: typeof P.text === "string" ? P.text : "", tags: P.tags, done: P.done === true, url: P.url });
+        if (P.text instanceof T.Live) this.text(n, "text", card.querySelector(".txt"));
+        if (P.cite) card.querySelector(".txt").after(this.text(n, "cite", el("div", { class: "cite" })));
+        return this.tone(n, card);
+      }
+      case "heading": return this.tone(n, this.text(n, "text", el("div", { class: "h" })));
+      case "value": {
+        const num = el("b"), box = el("div", { class: "value" }, this.text(n, "text", el("span")), num);
+        const set = () => { const v = this.val(P.value, n, "value"); const s2 = (typeof v === "number" ? fmtNum(v, P.digits) : v == null ? "—" : String(v)) + (P.suffix || ""); if (num.textContent !== s2) num.textContent = s2; };
+        if (P.value instanceof T.Live) this.updaters.push(set); else set();
+        return this.tone(n, box);
+      }
+      case "sketch": {
+        const w = P.w || 280, h = P.h || 170, cv = el("canvas", { class: "sketch" }); cv.style.width = w + "px"; cv.style.height = h + "px";
+        this.updaters.push(() => this.paintSketch(n, cv, w, h));
+        return cv;
+      }
+      case "button": {
+        const b = el("button", { type: "button", class: "btn app-btn" }); this.text(n, "text", b);
+        b.addEventListener("click", ev => { ev.stopPropagation(); this.runAct(P.act, n); });
+        return this.tone(n, b);
+      }
+      case "input": {
+        const i = el("input", { type: "text", class: "app-input", placeholder: P.placeholder, "aria-label": P.placeholder });
+        i.addEventListener("keydown", ev => { ev.stopPropagation(); if (ev.key === "Enter" && i.value.trim()) { const v = i.value.trim(); i.value = ""; this.runAct(P.act, n, [v]); } });
+        return this.tone(n, i);
+      }
+      case "editor": {
+        if (n.type === "terminal") {
+          const f = P.file, out = el("div", { class: "console" }), st = el("small"), btn = el("button", { type: "button", class: "btn sm run-btn" }, "Run");
+          btn.addEventListener("click", ev => { ev.stopPropagation(); const g = Store.byName(f.name, "program"); if (!g) { this.desk.o.toast && this.desk.o.toast(`No program called “${f.name}” yet.`); return; } if (this.desk.runner.running(g.id)) this.desk.runner.stop(g.id); else this.desk.runner.run(g.id, { by: "you" }); });
+          let sig = "";
+          this.updaters.push(() => {
+            const g = Store.byName(f.name, "program"), lines = g ? g.output || [] : [], running = !!g && this.desk.runner.running(g.id), s2 = (g ? g.updated : 0) + ":" + lines.length + ":" + running;
+            if (s2 === sig) return; sig = s2;
+            btn.textContent = running ? "Stop" : "Run"; btn.classList.toggle("running", running); st.textContent = !g ? " · no program yet" : running ? " · running" : g.status ? " · " + g.status : "";
+            out.replaceChildren(...(lines.length ? lines.slice(-80).map(l => el("div", { class: "ln " + (l.kind || "out") }, l.text)) : [el("div", { class: "ln quiet" }, "Press Run.")])); out.scrollTop = out.scrollHeight;
+          });
+          return this.tone(n, el("div", { class: "app-editor ae-terminal" }, el("div", { class: "ae-name" }, f.name, st), el("div", { class: "term-bar" }, btn), out));
+        }
+        const f = P.file, cur = Store.byName(f.name, n.type === "inspect" ? null : f.type), type = n.type === "inspect" ? (cur ? cur.type : f.type) : f.type;
+        const ed = editorFor(type === "note" ? "doc" : type, cur ? cur.content : f.seed, (v, base) => this.desk.writeFile(f.name, v, this, f.type, undefined, base), { placeholder: P.placeholder, markdown: type === "doc" || type === "note" });
+        const box = el("div", { class: "app-editor ae-" + type }, el("div", { class: "ae-name" }, f.name, cur ? null : el("small", null, " · new")), ed.el);
+        return this.tone(n, box);
+      }
+      case "facepile": {
+        // who is on this desktop right now
+        const box = el("div", { class: "l-facepile" }); let sig = null;
+        this.updaters.push(() => { const ps = this.c.people || [], s2 = ps.map(p => p.id + ":" + p.name).join(","); if (s2 === sig) return; sig = s2; box.replaceChildren(...(ps.length ? ps.map(p => el("span", { class: "k-person" }, face(p.id), P.names ? el("span", null, p.isMe ? "You" : p.name) : null)) : [el("span", { class: "l-empty sm" }, "Just you")])); });
+        return this.tone(n, box);
+      }
+      case "avatar": {
+        const box = el("span", { class: "k-person l-avatar" }); let sig = null;
+        const draw = () => { const id = this.val(P.who, n, "who"), p = id ? Store.person(id) : null, s2 = id + ":" + (p ? p.name + p.color : ""); if (s2 === sig) return; sig = s2; box.replaceChildren(...(id ? [face(id), el("span", null, personName(id))] : [])); };
+        this.updaters.push(draw); // a name arrives after the first frame, so it is checked every frame
+        return this.tone(n, box);
+      }
+      case "divider": return el("hr", { class: "l-divider" });
+      case "badge": return this.tone(n, this.text(n, "text", el("span", { class: "badge" })));
+      case "kit": {
+        const f = P.file, cur = Store.byName(f.name, f.type || "data") || Store.byName(f.name), data = cur ? cur.content : f.seed;
+        const appName = (this.file() || {}).name || "an app", view = KIT_VIEWS[n.type];
+        const ks = this.kitState || (this.kitState = {}), skey = n.pin || n.id;
+        // what each person does in it (votes, answers, a form) is theirs: a mark on the data file, when this computer knows who is who
+        const PERSONAL = ["poll", "quiz", "form", "cards"], scope = cur && PERSONAL.includes(n.type) && Store.marksOn() ? Store.markScope("f", cur.id) : null;
+        const people = scope ? { scope, mine: Store.myMark(scope), all: Store.marksFor(scope), owner: !!Store.me.isOwner,
+          set: (v, what) => { Store.setMark(scope, v); if (what) Store.log("act", `${appName}: ${what}`, cur.id, "you", "data"); } } : null;
+        const api = { preview: false, name: f.name, zoom: () => this.desk.cam.z, state: ks[skey] || (ks[skey] = { q: "", sort: null, dir: 1 }), editing: this.desk.editing.get(this.appId) === "edit", people,
+          write: (next, what) => this.desk.writeFile(f.name, next, this, f.type || "data", what, data),
+          // the data as it is now (a view drawn before your last keystrokes still sees the latest)
+          fresh: () => { const c = Store.byName(f.name, f.type || "data") || Store.byName(f.name); return c && c.content && typeof c.content === "object" ? c.content : data && typeof data === "object" ? data : {}; },
+          claude: (say, payload) => this.desk.o.toClaude ? this.desk.o.toClaude(say, payload, appName) : false };
+        const obj = data && typeof data === "object" ? data : {};
+        // Edit as text: the same few lines Claude writes, for the person to change directly
+        if (this.desk.editing.get(this.appId) === "text" && T.KITS[n.type]) return this.tone(n, kitTextEditor(n.type, obj, api, () => this.desk.setEditing(this.appId, null)));
+        let node; try { node = view(obj, api); } catch (e) { node = el("div", { class: "k-empty" }, `This ${n.type} could not show its data: ${e.message}`); }
+        return this.tone(n, node);
+      }
+      case "choices": {
+        const box = el("div", { class: "k k-choices" }), row = el("div", { class: "k-choice-row" });
+        box.append(this.text(n, "text", el("div", { class: "k-q" })), row);
+        for (const o of P.options) row.append(el("button", { type: "button", class: "btn", onclick: ev => { ev.stopPropagation(); const q = typeof P.text === "string" ? P.text : this.val(P.text, n, "text"); this.desk.o.toClaude && this.desk.o.toClaude(String(q ?? ""), { picked: o }, (this.file() || {}).name || "an app"); } }, o));
+        return this.tone(n, box);
+      }
+      case "progress": {
+        const bar = el("i"), num = el("b"), box = el("div", { class: "k-progress" }, this.text(n, "text", el("span")), num, el("div", { class: "kp-bar" }, bar));
+        const set = () => { const v = Number(this.val(P.value, n, "value")) || 0, mx = Number(this.val(P.max, n, "max")) || 100; bar.style.width = Math.max(0, Math.min(100, v / mx * 100)) + "%"; const s2 = fmtNum(v) + " / " + fmtNum(mx); if (num.textContent !== s2) num.textContent = s2; };
+        if (P.value instanceof T.Live || P.max instanceof T.Live) this.updaters.push(set); set();
+        return this.tone(n, box);
+      }
+      case "md": {
+        const box = el("div", { class: "k-md" });
+        if (P.text instanceof T.Live) { let last = null; this.updaters.push(() => { const t = String(this.val(P.text, n, "text") ?? ""); if (t !== last) { last = t; box.replaceChildren(mdRender(t)); } }); }
+        else box.append(mdRender(P.text));
+        return this.tone(n, box);
+      }
+      case "files": {
+        const list = this.desk.filesFor(P.filter), box = el("div", { class: "files-view" });
+        if (!list.length) box.append(el("div", { class: "empty" }, `No ${P.filter.type ? [].concat(P.filter.type).join(" or ") + " " : ""}files yet.`));
+        for (const f of list) box.append(el("button", { type: "button", class: "file-tile ft-" + f.type, title: `Open ${f.name}`, onclick: ev => { ev.stopPropagation(); this.desk.openFile(f.id, this.appId); } }, el("i", { class: "fg" }), el("span", null, f.name), el("small", null, TYPE_LABEL[f.type] + (f.placed ? "" : " · tucked away"))));
+        return this.tone(n, box);
+      }
+      case "stream": {
+        const list = this.desk.claims.get(this.appId + ":" + n.id) || [], box = el("div", { class: "stream l-" + (P.layout || "stack") });
+        if (P.layout === "grid") box.style.gridTemplateColumns = `repeat(${P.cols || 2}, 220px)`;
+        if (!list.length) {
+          const f = P.filter;
+          box.append(el("div", { class: "empty" }, f.unsorted ? "New captures land here." : `Notes ${[f.kind && `of kind ${[].concat(f.kind).join(" or ")}`, f.tag && `tagged #${f.tag}`, f.by && f.by !== "any" && `by ${f.by}`, f.text && `mentioning “${f.text}”`].filter(Boolean).join(", ") || "you capture"} land here.`));
+        } else for (const t of list) { const st = P.style ? this.val(P.style, n, "style", [t]) : null; box.append(noteCard(t, st || {})); }
+        if (P.layout === "cluster") this.cluster(n, box);
+        if (P.assign && !this.insideZone(n)) box.dataset.drop = this.appId + ":" + n.id;
+        return box;
+      }
+      case "empty": return this.tone(n, el("div", { class: "l-empty" }, svgIcon("apps", 20), this.text(n, "text", el("span"))));
+      case "spacer": return el("span", { class: "l-spacer" });
+      case "icon": return this.tone(n, el("span", { class: "l-icon" }, svgIcon(P.name)));
+      case "list": {
+        // a list of items (from live(), a records store, or an array) you pick from, like a mail or contacts list
+        const box = el("div", { class: "l-list", role: "listbox" }); let sig = null;
+        const field = (v, it, slot) => v instanceof T.Live ? this.val(v, n, slot, [it]) : typeof v === "string" ? it && typeof it === "object" ? it[v] : undefined : undefined;
+        const items = () => { const v = P.items; const x = v instanceof T.Live ? this.val(v, n, "items") : typeof v === "string" ? recordsOp(v, "list") : v; return Array.isArray(x) ? x : []; };
+        const draw = () => {
+          const list = items(), sel = P.selected instanceof T.Live ? this.val(P.selected, n, "selected") : P.selected;
+          const rows = list.map((it, i) => { const id = it && typeof it === "object" ? it.id ?? i : it; return { it, id, t: String(field(P.title, it, "title") ?? (typeof it === "object" ? it.name ?? it.title ?? it.text ?? Object.values(it).find(v => typeof v === "string") ?? "" : it)), s: P.subtitle ? String(field(P.subtitle, it, "subtitle") ?? "") : "", m: P.meta ? String(field(P.meta, it, "meta") ?? "") : "", ic: P.icon ? field(P.icon, it, "icon") : null }; });
+          const s2 = JSON.stringify([rows.map(r => [r.id, r.t, r.s, r.m, r.ic]), sel]); if (s2 === sig) return; sig = s2;
+          box.replaceChildren(...(rows.length ? rows.map(r => {
+            const b = el("button", { type: "button", class: "l-item" + (sel != null && String(sel) === String(r.id) ? " on" : ""), role: "option", "aria-selected": String(sel != null && String(sel) === String(r.id)) },
+              r.ic ? (T.APP_ICON[r.ic] ? appTile(r.ic, 26) : el("span", { class: "l-ic" }, svgIcon(T.ICONS[r.ic] ? r.ic : "app"))) : null,
+              el("span", { class: "l-tx" }, el("b", null, r.t), r.s ? el("small", null, r.s) : null), r.m ? el("span", { class: "l-meta" }, r.m) : null);
+            if (P.pick) b.addEventListener("click", ev => { ev.stopPropagation(); this.runAct(P.pick, n, [r.it]); }); else b.disabled = true;
+            return b;
+          }) : [el("div", { class: "l-empty sm" }, "Nothing here yet.")]));
+        };
+        this.updaters.push(draw);
+        return this.tone(n, box);
+      }
+      case "layout": {
+        if (n.type === "split") { const [a, b] = n.kids; const side = el("aside", { class: "l-side" }, kid(a)), main = el("div", { class: "l-main" }, kid(b)); const w = s.byId[a].props.w; if (w) side.style.width = w + "px"; return this.tone(n, el("div", { class: "l-split" }, side, main)); }
+        if (n.type === "panel") { const p = el("section", { class: "l-panel" }, el("header", null, this.text(n, "title", el("span")))); const body = el("div", { class: "l-pbody" }); n.kids.forEach(id => body.append(kid(id))); p.append(body); return this.tone(n, p); }
+        if (n.type === "zone") {
+          const title = this.text(n, "title", el("span", { class: "zt" })), count = el("span", { class: "zc" }), body = el("div", { class: "zb" });
+          const z = el("section", { class: "zone" }, el("header", null, title, count, P.accepts ? el("span", { class: "zd" }, "Drop here") : null), body);
+          n.kids.forEach(id => body.append(kid(id)));
+          const c = this.zoneCount(n); count.textContent = c ? String(c) : "";
+          if (P.accepts) z.dataset.drop = this.appId + ":" + P.accepts;
+          return this.tone(n, z);
+        }
+        if (n.type === "tree") {
+          const box = el("div", { class: "l-tree" }), kids = el("div", { class: "tree-kids" });
+          box.append(el("div", { class: "tree-root" }, kid(n.kids[0])));
+          n.kids.slice(1).forEach(id => kids.append(el("div", { class: "tree-kid" }, kid(id))));
+          if (n.kids.length > 1) box.append(kids);
+          return this.tone(n, box);
+        }
+        if (n.type === "tabs") {
+          const key = n.pin || n.id, at = Math.min((this.tabAt || (this.tabAt = {}))[key] || 0, n.kids.length - 1), panes = n.kids.map(id => kid(id));
+          const bar = el("div", { class: "l-tabbar", role: "tablist" }, ...P.titles.map((t, i) => el("button", { type: "button", role: "tab", "aria-selected": String(i === at), onclick: ev => { ev.stopPropagation(); this.tabAt[key] = i; bar.querySelectorAll("button").forEach((b, k) => b.setAttribute("aria-selected", String(k === i))); panes.forEach((p, k) => (p.hidden = k !== i)); } }, t)));
+          panes.forEach((p, k) => (p.hidden = k !== at));
+          return this.tone(n, el("div", { class: "l-tabs" }, bar, el("div", { class: "l-tabpanes" }, ...panes)));
+        }
+        if (n.type === "orbit") { const box = el("div", { class: "l-orbit" }); n.kids.forEach(id => box.append(kid(id))); this.orbit(n, box); return this.tone(n, box); }
+        if (n.type === "cluster") { const box = el("div", { class: "l-cluster" }); n.kids.forEach(id => box.append(kid(id))); this.cluster(n, box); return this.tone(n, box); }
+        const box = el("div", { class: "l-" + n.type });
+        if (n.type === "grid") box.style.gridTemplateColumns = `repeat(${P.cols}, max-content)`;
+        if (P.gap != null) box.style.gap = P.gap + "px";
+        n.kids.forEach(id => box.append(kid(id)));
+        return this.tone(n, box);
+      }
+    }
+    return el("div");
+  }
+  insideZone(n) { const s = this.compiled.session; let p = n.parent ? s.byId[n.parent] : null; while (p) { if (p.type === "zone") return true; p = p.parent ? s.byId[p.parent] : null; } return false; }
+  zoneCount(n) { const s = this.compiled.session; let c = 0; const walk = id => { const m = s.byId[id]; if (!m) return; if (m.type === "stream") c += (this.desk.claims.get(this.appId + ":" + m.id) || []).length; else if (m.type !== "zone" || m === n) m.kids.forEach(walk); }; walk(n.id); return c; }
+  orbit(n, box) {
+    const place = () => {
+      const kids = [...box.children]; if (!kids.length) return;
+      const turn = Number(this.val(n.props.turn, n, "turn")) || 0, c = kids[0], rest = kids.slice(1);
+      const sz = k => [k.offsetWidth, k.offsetHeight], [cw, ch] = sz(c);
+      const kr = Math.max(0, ...rest.map(k => Math.hypot(...sz(k)) / 2)), R = Math.hypot(cw, ch) / 2 + kr + (n.props.gap != null ? n.props.gap : 28);
+      const pos = rest.map((k, i) => { const a = turn - Math.PI / 2 + i * 2 * Math.PI / Math.max(1, rest.length); return [k, Math.cos(a) * R, Math.sin(a) * R]; });
+      const xs = [-cw / 2, cw / 2].concat(...pos.map(([k, x]) => [x - k.offsetWidth / 2, x + k.offsetWidth / 2])), ys = [-ch / 2, ch / 2].concat(...pos.map(([k, , y]) => [y - k.offsetHeight / 2, y + k.offsetHeight / 2]));
+      const mx = Math.min(...xs), my = Math.min(...ys);
+      box.style.width = Math.max(...xs) - mx + "px"; box.style.height = Math.max(...ys) - my + "px";
+      c.style.left = -mx - cw / 2 + "px"; c.style.top = -my - ch / 2 + "px";
+      for (const [k, x, y] of pos) { k.style.left = -mx + x - k.offsetWidth / 2 + "px"; k.style.top = -my + y - k.offsetHeight / 2 + "px"; }
+      // spokes
+      let svg = box.querySelector(":scope > svg"); if (!svg) { svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); svg.setAttribute("class", "spokes"); box.prepend(svg); }
+      svg.setAttribute("width", box.style.width); svg.setAttribute("height", box.style.height);
+      svg.innerHTML = pos.map(([, x, y]) => `<line x1="${-mx}" y1="${-my}" x2="${-mx + x}" y2="${-my + y}"/>`).join("");
+    };
+    this.updaters.push(n.props.turn instanceof T.Live ? place : (() => { let done = 0; return () => { if (done++ < 2) place(); }; })());
+  }
+  cluster(n, box) {
+    let sim = this.sims.get(n.id); if (!sim) { sim = new Map(); this.sims.set(n.id, sim); }
+    this.updaters.push(() => {
+      const kids = [...box.children].filter(k => k.tagName !== "svg" && !k.classList.contains("empty")); if (!kids.length) return;
+      const bodies = kids.map(k => { const key = k.dataset.note || k.dataset.node || k.textContent; let b = sim.get(key); if (!b) { const h = parseInt(T.fnv1a(key).slice(0, 6), 16), a = (h % 628) / 100; b = { x: Math.cos(a) * (40 + h % 80), y: Math.sin(a) * (40 + h % 60), vx: 0, vy: 0 }; sim.set(key, b); } return { k, b, w: k.offsetWidth, h: k.offsetHeight, key }; });
+      const m = n.props.gap != null ? n.props.gap : 16, byKey = new Map(bodies.map(o => [o.key, o]));
+      for (let i = 0; i < bodies.length; i++) for (let j = i + 1; j < bodies.length; j++) {
+        const A = bodies[i], B = bodies[j], dx = B.b.x - A.b.x, dy = B.b.y - A.b.y, ox = (A.w + B.w) / 2 + m - Math.abs(dx), oy = (A.h + B.h) / 2 + m - Math.abs(dy);
+        if (ox > 0 && oy > 0) { if (ox < oy) { const f = (dx < 0 ? -1 : 1) * ox * 0.12; A.b.vx -= f; B.b.vx += f; } else { const f = (dy < 0 ? -1 : 1) * oy * 0.12; A.b.vy -= f; B.b.vy += f; } }
+      }
+      for (const o of bodies) { o.b.vx -= o.b.x * 0.004; o.b.vy -= o.b.y * 0.006; }
+      for (const t of this.desk.notesCache) for (const l of t.links || []) { const A = byKey.get(t.id), B = byKey.get(l); if (!A || !B) continue; const dx = B.b.x - A.b.x, dy = B.b.y - A.b.y, dist = Math.hypot(dx, dy) || 1, f = (dist - 240) * 0.00002 * dist; A.b.vx += dx / dist * f; A.b.vy += dy / dist * f; B.b.vx -= dx / dist * f; B.b.vy -= dy / dist * f; }
+      for (const o of bodies) { o.b.vx *= 0.82; o.b.vy *= 0.82; o.b.x += o.b.vx; o.b.y += o.b.vy; }
+      const mx = Math.min(...bodies.map(o => o.b.x - o.w / 2)), my = Math.min(...bodies.map(o => o.b.y - o.h / 2));
+      box.style.width = Math.max(...bodies.map(o => o.b.x + o.w / 2)) - mx + "px"; box.style.height = Math.max(...bodies.map(o => o.b.y + o.h / 2)) - my + "px";
+      for (const o of bodies) { o.k.style.left = o.b.x - o.w / 2 - mx + "px"; o.k.style.top = o.b.y - o.h / 2 - my + "px"; }
+    });
+  }
+  paintSketch(n, cv, w, h) {
+    const dpr = Math.min(window.devicePixelRatio || 1, 3) * Math.max(1, this.desk.cam.z), K = this.desk.o.tokens();
+    if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+    const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    const col = c => (c && K[c]) || c || K.ink;
+    const api = { w, h, ctx: g, color: col,
+      circle(x, y, r, c) { g.beginPath(); g.arc(x, y, Math.max(0, r), 0, Math.PI * 2); g.fillStyle = col(c); g.fill(); },
+      ring(x, y, r, c, lw) { g.beginPath(); g.arc(x, y, Math.max(0, r), 0, Math.PI * 2); g.strokeStyle = col(c); g.lineWidth = lw || 1; g.stroke(); },
+      rect(x, y, ww, hh, c) { g.fillStyle = col(c); g.fillRect(x, y, ww, hh); },
+      line(x1, y1, x2, y2, c, lw) { g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.strokeStyle = col(c); g.lineWidth = lw || 1; g.stroke(); },
+      text(s, x, y, c, size) { g.fillStyle = col(c); g.font = `700 ${size || 12}px Arial, Helvetica, sans-serif`; g.fillText(String(s), x, y); } };
+    this.val(n.props.paint, n, "paint", [api]);
+  }
+  drawLinks(root) {
+    const z = this.desk.cam.z, rr = root.getBoundingClientRect(), K = this.desk.o.tokens();
+    this.svg.setAttribute("width", root.scrollWidth); this.svg.setAttribute("height", root.scrollHeight);
+    const box = id => { const e = this.nodeEls.get(id); if (!e) return null; const r = e.getBoundingClientRect(); return { x: (r.left - rr.left) / z, y: (r.top - rr.top) / z, w: r.width / z, h: r.height / z }; };
+    let out = "";
+    for (const l of this.links) {
+      const A = box(l.props.fromId), B = box(l.props.toId); if (!A || !B) continue;
+      const lab = this.val(l.props.label, l, "label");
+      out += linkPath(A, B, lab == null ? "" : String(lab), K, false);
+    }
+    this.svg.innerHTML = out;
+  }
+  frame() { this.c = this.ctx(false); for (const u of this.updaters) { try { u(); } catch (e) { console.warn(e); } } }
+}
+function linkPath(A, B, label, K, accent) {
+  const ax = A.x + A.w / 2, ay = A.y + A.h / 2, bx = B.x + B.w / 2, by = B.y + B.h / 2, horiz = Math.abs(bx - ax) > Math.abs(by - ay);
+  const p1 = horiz ? [bx > ax ? A.x + A.w : A.x, ay] : [ax, by > ay ? A.y + A.h : A.y], p2 = horiz ? [bx > ax ? B.x : B.x + B.w, by] : [bx, by > ay ? B.y : B.y + B.h];
+  const c1 = horiz ? [(p1[0] + p2[0]) / 2, p1[1]] : [p1[0], (p1[1] + p2[1]) / 2], c2 = horiz ? [(p1[0] + p2[0]) / 2, p2[1]] : [p2[0], (p1[1] + p2[1]) / 2];
+  const ang = Math.atan2(p2[1] - c2[1], p2[0] - c2[0]), s = 7;
+  const col = accent ? K.accent : K.ink2;
+  let out = `<path d="M${p1[0]},${p1[1]} C${c1[0]},${c1[1]} ${c2[0]},${c2[1]} ${p2[0]},${p2[1]}" stroke="${col}" fill="none" stroke-width="1.25"/>`;
+  out += `<path d="M${p2[0]},${p2[1]} L${p2[0] - Math.cos(ang - 0.45) * s},${p2[1] - Math.sin(ang - 0.45) * s} L${p2[0] - Math.cos(ang + 0.45) * s},${p2[1] - Math.sin(ang + 0.45) * s}Z" fill="${col}"/>`;
+  if (label) { const mx = (p1[0] + p2[0]) / 2, my = (p1[1] + p2[1]) / 2, w = label.length * 5.6 + 10; out += `<rect x="${mx - w / 2}" y="${my - 8}" width="${w}" height="16" fill="${K.canvas}"/><text x="${mx}" y="${my + 3.5}" text-anchor="middle" font-size="10" font-weight="700" font-family="Arial, Helvetica, sans-serif" fill="${K.ink2}">${escH(label)}</text>`; }
+  return out;
+}
+
+/* ==========================================================================
+   PROGRAMS · real JavaScript that runs on the desktop, together.
+   A program file holds code. Run executes it as an async function in a Web
+   Worker (so an endless loop cannot freeze the desktop, and Stop always
+   works); when the browser refuses workers it runs on the page with a loop
+   guard instead. The code talks to the desktop through a small API, every
+   call a message to this page, which does the reading and writing:
+     print(...) · await read(name) · await write(name, value) · await append(name, value)
+     await files(filter?) · await note(text, kind?) · await sleep(ms) · await ask(prompt)
+     await run(name, input) · clear() · input · return value
+   Output and status are saved on the file itself, so everyone looking at the
+   desktop (and Claude in the chat) sees the same console.
+   ========================================================================== */
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const PROGRAM_API = ["print", "read", "write", "append", "files", "note", "sleep", "ask", "run", "clear", "records", "add", "update", "remove", "open", "make", "me", "people"];
+const WORKER_SRC = `"use strict";
+const pending = new Map(); let seq = 0;
+const call = (op, args) => new Promise((res, rej) => { const id = ++seq; pending.set(id, { res, rej }); postMessage({ t: "call", id, op, args }); });
+const fmt = v => typeof v === "string" ? v : (() => { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } })();
+self.print = (...a) => { postMessage({ t: "print", text: a.map(fmt).join(" ") }); };
+self.console = { log: self.print, info: self.print, warn: (...a) => postMessage({ t: "print", kind: "warn", text: a.map(fmt).join(" ") }), error: (...a) => postMessage({ t: "print", kind: "error", text: a.map(fmt).join(" ") }) };
+for (const op of ["read", "write", "append", "files", "note", "ask", "run", "records", "add", "update", "remove", "open", "make"]) self[op] = (...args) => call(op, args);
+self.clear = () => postMessage({ t: "clear" });
+self.sleep = ms => new Promise(r => setTimeout(r, Math.max(0, Number(ms) || 0)));
+onmessage = async e => {
+  const m = e.data;
+  if (m.t === "reply") { const p = pending.get(m.id); if (p) { pending.delete(m.id); m.error ? p.rej(new Error(m.error)) : p.res(m.value); } return; }
+  if (m.t === "start") {
+    self.me = m.me || null; self.people = m.people || [];
+    try {
+      const fn = new (Object.getPrototypeOf(async function () {}).constructor)("input", m.code);
+      const v = await fn(m.input);
+      let out = null; try { out = v === undefined ? null : JSON.parse(JSON.stringify(v)); } catch (err) { out = String(v); }
+      postMessage({ t: "done", value: out });
+    } catch (err) { postMessage({ t: "error", message: String((err && err.message) || err), stack: String((err && err.stack) || "") }); }
+  }
+};
+postMessage({ t: "ready" });`;
+let workerURL = null, workersOK = null;
+/* where a thrown error points in the program (the async wrapper adds two lines) */
+function programLine(stack) { const m = String(stack || "").match(/<anonymous>:(\d+):(\d+)/); return m ? Math.max(1, +m[1] - 2) : null; }
+/* syntax check without running: → null or { line, message } */
+function checkProgram(code) {
+  try { new AsyncFunction("input", ...PROGRAM_API, String(code || "")); return null; }
+  catch (e) { const m = String(e.stack || "").match(/<anonymous>:(\d+):(\d+)/); return { line: m ? Math.max(1, +m[1] - 2) : null, message: e.message }; }
+}
+/* the loop guard for the fallback: every loop body checks the clock */
+function guardLoops(code) { return String(code).replace(/\b(for|while)\s*(\((?:[^()]|\([^()]*\))*\))\s*\{/g, "$1 $2 { __g();").replace(/\bdo\s*\{/g, "do { __g();"); }
+class Runner {
+  constructor(o) { this.o = o; this.runs = new Map(); }
+  running(id) { return this.runs.has(id); }
+  stop(id) { const r = this.runs.get(id); if (r) r.stop("Stopped."); }
+  /* run a program file; resolves { ok, value, error, line } */
+  run(fileId, opts) {
+    opts = opts || {};
+    const f0 = Store.files.get(fileId); if (!f0) return Promise.resolve({ ok: false, error: "No such program." });
+    if (f0.type !== "program") return Promise.resolve({ ok: false, error: `“${f0.name}” is a ${f0.type}, not a program.` });
+    if (!T.Trust.trusted(f0)) return Promise.resolve({ ok: false, untrusted: true, error: `“${f0.name}” was written by someone else. Open it and press Run once to trust it.` });
+    if (this.runs.has(fileId)) return Promise.resolve({ ok: false, error: `“${f0.name}” is already running.` });
+    const depth = opts.depth || 0; if (depth > 4) return Promise.resolve({ ok: false, error: "Programs called each other more than 4 deep." });
+    const by = opts.by || "you", code = String(f0.content || ""), t0 = Date.now();
+    // who pressed Run, and who is here: plain data the program can read as me and people
+    const who = { me: clone(this.o.me ? this.o.me() : null), people: clone(this.o.peopleHere ? this.o.peopleHere() : []) };
+    const out = opts.keep ? (f0.output || []).slice() : []; let dirty = true, flushT = null, ended = false, closed = false;
+    // the console lives on the file, and a document holds at most 256 KiB: keep the newest lines that fit in 100 KB
+    const fit = () => { let o = out.slice(-300); while (o.length > 1 && JSON.stringify(o).length > 100000) o = o.slice(Math.ceil(o.length / 4)); return o; };
+    const flush = final => { clearTimeout(flushT); flushT = null; if (!Store.files.has(fileId) || closed) return; if (ended && !final) return; Store.update(fileId, Object.assign({ output: fit(), status: final || "running", ranBy: by, ranAt: t0, took: final ? Date.now() - t0 : null, runRequest: null }, who.me && who.me.id ? { ranWho: who.me.id } : {}), by, false); dirty = false; if (final) closed = true; };
+    const line = (text, kind) => { if (closed) return; out.push({ at: Date.now(), kind: kind || "out", text: String(text).slice(0, 500) }); if (out.length > 400) out.splice(0, out.length - 400); dirty = true; if (!flushT) flushT = setTimeout(() => flush(), 350); };
+    const syn = checkProgram(code);
+    if (syn) { line(`Line ${syn.line ?? "?"}: ${syn.message}`, "error"); flush("error"); return Promise.resolve({ ok: false, error: syn.message, line: syn.line }); }
+    Store.log("run", `Ran “${f0.name}”`, fileId, by, "program");
+    const stopAsk = new AbortController(); // a stopped program stops its questions too
+    const touched = new Set(), once = id => { if (touched.has(id)) return false; touched.add(id); return "edit"; }; // a loop that writes 300 times logs once
+    flush();
+    // names reach data files first: a program never overwrites a program or an app unless it names the type
+    const typeOf = v => typeof v === "string" ? "doc" : Array.isArray(v) && v.length && v.every(x => x && typeof x === "object" && "text" in x) ? "list" : v && typeof v === "object" && Array.isArray(v.cols) ? "table" : "data";
+    const dataFile = (name, type) => { const n = String(name); const all = Store.list().filter(f => (f.id === n || f.name === n) && f.type !== "program" && f.type !== "app"); return (type && all.find(f => f.type === type)) || all[0] || null; };
+    const api = {
+      read: name => { const f = Store.files.get(name) || dataFile(name) || Store.byName(String(name)); if (!f) throw new Error(`No file called “${name}”.`); return clone(f.content); },
+      write: (name, value, type) => { const v = clone(value === undefined ? null : value), t = type || typeOf(v), f = type ? Store.byName(String(name), type) : dataFile(name, t); if (f) { Store.update(f.id, { content: v }, by, once(f.id)); return f.id; } const d = DEFAULT_SIZE[t] || [320, 240], at = this.o.spotNear ? this.o.spotNear(fileId, d[0], d[1]) : null; return Store.add({ name: String(name), type: t, content: v, placed: !!at, x: at ? at.x : 0, y: at ? at.y : 0 }, by).id; },
+      append: (name, value) => { const f = dataFile(name); if (!f) return api.write(name, Array.isArray(value) ? value : value && typeof value === "object" ? [value] : String(value)); let c = clone(f.content); if (Array.isArray(c)) c = c.concat(Array.isArray(value) ? value : [f.type === "list" && typeof value === "string" ? { text: value, done: false } : value]); else if (f.type === "table" && c) c = Object.assign({}, c, { rows: (c.rows || []).concat(Array.isArray(value) && Array.isArray(value[0]) ? value : [value]) }); else c = String(c ?? "") + (String(c ?? "") ? "\n" : "") + String(value); Store.update(f.id, { content: c }, by, once(f.id)); return f.id; },
+      files: filter => Store.list().filter(f => !filter || Object.entries(filter).every(([k, v]) => f[k] === v)).map(f => ({ id: f.id, name: f.name, type: f.type, placed: !!f.placed, by: f.by, kind: f.kind || null, tags: f.tags || [] })),
+      note: (text, kind) => { const p = T.parseCapture(String(text)); return Store.add({ type: "note", content: p.text, kind: kind || p.kind, tags: p.tags, placed: false }, by).id; },
+      ask: prompt => { if (!this.o.ask) throw new Error("Asking Claude is not available here."); return this.o.ask(String(prompt), stopAsk.signal); },
+      records: (name, query) => recordsOp(name, "list", query),
+      add: (name, rec) => recordsOp(name, "add", rec, null, by),
+      update: (name, id, patch) => recordsOp(name, "update", id, patch, by),
+      remove: (name, id) => recordsOp(name, "remove", id, null, by),
+      open: name => { const f = Store.files.get(name) || Store.byName(String(name), "app") || Store.byName(String(name)); if (!f) throw new Error(`No file called “${name}”.`); if (this.o.open) this.o.open(f.id); return f.id; },
+      make: request => { if (!this.o.make) throw new Error("The built-in Claude is not available here."); return this.o.make(String(request)).then(r => ({ ok: !!(r && r.ok), made: ((r && r.results) || []).filter(x => x.ok).map(x => x.text) })); },
+      run: (name, input) => { const f = Store.byName(String(name), "program"); if (!f) throw new Error(`No program called “${name}”.`); return this.run(f.id, { by, input, depth: depth + 1 }).then(r => { if (!r.ok) throw new Error(`${name}: ${r.error}`); return r.value; }); },
+    };
+    return new Promise(resolve => {
+      let worker = null, fallback = null, stopped = false;
+      const finish = (res) => {
+        if (ended) return; ended = true; this.runs.delete(fileId); try { stopAsk.abort(); } catch (e) {}
+        if (worker) { worker.terminate(); worker = null; }
+        if (res.ok && res.value !== null && res.value !== undefined) line("→ " + (typeof res.value === "string" ? res.value : JSON.stringify(res.value, null, 2)), "result");
+        if (!res.ok) line((res.line ? `Line ${res.line}: ` : "") + res.error, "error");
+        flush(res.ok ? "done" : stopped ? "stopped" : "error");
+        Store.log(res.ok ? "done" : "run", `“${f0.name}” ${res.ok ? "finished" : stopped ? "was stopped" : "failed"} after ${((Date.now() - t0) / 1000).toFixed(1)} s`, fileId, by, "program");
+        this.o.onChange && this.o.onChange(fileId); resolve(res);
+      };
+      const handle = (op, args) => { if (!(op in api)) throw new Error("Unknown call " + op); return api[op](...(args || [])); };
+      const startFallback = () => {
+        // no workers here: run on the page, with every loop checking the clock
+        const budget = { t: Date.now() };
+        const __g = () => { if (stopped) throw new Error("Stopped."); if (Date.now() - budget.t > 8000) throw new Error("Ran 8 s without pausing. Add `await sleep(0)` inside long loops."); };
+        const wrap = fn => async (...a) => { const v = await fn(...a); if (stopped) throw new Error("Stopped."); budget.t = Date.now(); return v; };
+        const env = { print: (...a) => line(a.map(v => typeof v === "string" ? v : JSON.stringify(v)).join(" ")), clear: () => { out.length = 0; dirty = true; }, sleep: wrap(ms => new Promise(r => setTimeout(r, Math.max(0, Number(ms) || 0)))), me: who.me, people: who.people };
+        for (const k of ["read", "write", "append", "files", "note", "ask", "run", "records", "add", "update", "remove", "open", "make"]) env[k] = wrap(async (...a) => handle(k, a));
+        // the page's own globals are shadowed, so a program cannot reach the store or settings from here
+        const HIDE = ["window", "self", "globalThis", "document", "localStorage", "sessionStorage", "indexedDB", "claude", "Tanke", "tanke", "computer", "fetch", "XMLHttpRequest", "WebSocket", "parent", "top", "opener"];
+        let fn; try { fn = new AsyncFunction("input", ...PROGRAM_API, "__g", ...HIDE, guardLoops(code)); } catch (e) { finish({ ok: false, error: e.message }); return; }
+        fallback = true;
+        Promise.resolve().then(() => fn(clone(opts.input ?? null), ...PROGRAM_API.map(k => env[k]), __g)).then(v => { let o2 = null; try { o2 = v === undefined ? null : clone(v); } catch (e) { o2 = String(v); } finish({ ok: true, value: o2 }); }, e => finish({ ok: false, error: (e && e.message) || String(e), line: programLine(e && e.stack) }));
+      };
+      // Stop always ends the run here, even when the code is stuck in a promise that never settles
+      this.runs.set(fileId, { stop: msg => { stopped = true; finish({ ok: false, error: msg || "Stopped." }); } });
+      if (workersOK === false) { startFallback(); return; }
+      try { if (!workerURL) workerURL = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" })); worker = new Worker(workerURL); }
+      catch (e) { workersOK = false; worker = null; startFallback(); return; }
+      let ready = false;
+      // a refused worker means no workers here; a slow one only means this run falls back
+      const failStart = refused => { if (ready || ended) return; if (refused) workersOK = false; if (worker) { worker.terminate(); worker = null; } startFallback(); };
+      const startT = setTimeout(() => failStart(false), 4000);
+      worker.onerror = ev => { ev.preventDefault && ev.preventDefault(); if (!ready) { clearTimeout(startT); failStart(true); } else finish({ ok: false, error: ev.message || "The program crashed." }); };
+      worker.onmessage = async e => {
+        const m = e.data || {};
+        if (m.t === "ready") { ready = true; workersOK = true; clearTimeout(startT); worker.postMessage({ t: "start", code, input: clone(opts.input ?? null), me: who.me, people: who.people }); return; }
+        if (m.t === "print") return line(m.text, m.kind);
+        if (m.t === "clear") { out.length = 0; dirty = true; return; }
+        if (m.t === "call") { let value, error; try { value = clone(await handle(m.op, m.args)); } catch (err) { error = (err && err.message) || String(err); } if (worker) worker.postMessage({ t: "reply", id: m.id, value, error }); return; }
+        if (m.t === "done") return finish({ ok: true, value: m.value });
+        if (m.t === "error") return finish({ ok: false, error: m.message, line: programLine(m.stack) });
+      };
+    });
+  }
+}
+
+/* an app while Claude writes it: its parts arrive one by one, the code stays out of the way */
+const SKELETON_SKIP = new Set(["app", "space", "file", "live", "act", "params", "slider", "checkbox", "choice", "field", "repeat", "link"]);
+function appSkeleton(src, caret) {
+  const box = el("div", { class: "sk" }), seen = [];
+  for (const m of String(src).matchAll(/\b([a-z]+)\s*\(/g)) if (T.DSL_NAMES.includes(m[1]) && !SKELETON_SKIP.has(m[1])) seen.push(m[1]);
+  const title = (String(src).match(/app\(\s*["'`]([^"'`]+)/) || [])[1];
+  box.append(el("div", { class: "sk-title" }, title ? `Building ${title}` : "Building the app"));
+  for (const p of seen.slice(-14)) box.append(el("div", { class: "sk-row sk-" + p }, el("i"), el("span", null, p)));
+  box.append(el("div", { class: "sk-row sk-next" }, caret()));
+  return box;
+}
+
+/* ==========================================================================
+   DESKTOP · objects, claims, camera, gestures
+   ========================================================================== */
+class Desktop {
+  constructor(o) {
+    this.o = o; this.stage = o.stage; this.world = o.world;
+    this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); this.svg.setAttribute("class", "world-links"); this.world.append(this.svg);
+    this.cam = { x: -60, y: -80, z: 1 }; this.objs = new Map(); this.apps = new Map(); this.claims = new Map(); this.owner = new Map(); this.notesCache = [];
+    this.drafts = new Map(); this.camAnim = null; this.editing = new Map();
+    this.remoteDrag = new Map(); // id → { x, y, w, h }: a window someone else is dragging right now
+    this.runner = new Runner({ ask: o.askClaude, make: o.make, me: () => o.me && o.me(), peopleHere: () => o.peopleHere ? o.peopleHere() : [], open: id => this.openFile(id), onChange: () => this.sync(), spotNear: (id, w, h) => { const ob = this.objs.get(id); const s = this.freeSpot(w, h, ob ? { x: ob.el.offsetLeft + ob.el.offsetWidth + 32, y: ob.el.offsetTop } : null); this.reserve(s.x, s.y, w, h); return s; } });
+    this.t0 = performance.now(); this.t = 0; this.dt = 0; this.frameN = 0; this.sel = null; this.drag = null; this.pointers = new Map();
+    this.inbox = el("section", { class: "obj inbox", "data-drop": "inbox" }, el("header", { class: "obj-head", "data-drag": "inbox" }, el("i", { class: "fg" }), el("span", { class: "nm" }, "Inbox"), el("span", { class: "zc" }), el("span", { class: "grow" }), el("span", { class: "zd" }, "Drop to unsort")), el("div", { class: "obj-body inbox-body" }));
+    this.world.append(this.inbox);
+    this.applyCam(); this.bind();
+  }
+  /* ---------- camera ---------- */
+  applyCam() {
+    const { x, y, z } = this.cam;
+    this.world.style.transform = `translate(${-x * z}px, ${-y * z}px) scale(${z})`;
+    this.world.style.setProperty("--iz", String(1 / z)); // pointers and labels drawn in the world stay at screen size
+    const step = 24 * z; this.stage.style.backgroundSize = `${step}px ${step}px`; this.stage.style.backgroundPosition = `${-x * z}px ${-y * z}px`;
+    this.o.onCamera && this.o.onCamera(this.cam);
+  }
+  toWorld(sx, sy) { const r = this.stage.getBoundingClientRect(); return { x: (sx - r.left) / this.cam.z + this.cam.x, y: (sy - r.top) / this.cam.z + this.cam.y }; }
+  zoomAt(sx, sy, f) { const r = this.stage.getBoundingClientRect(), w = this.toWorld(sx, sy); this.cam.z = Math.max(0.12, Math.min(2.5, this.cam.z * f)); this.cam.x = w.x - (sx - r.left) / this.cam.z; this.cam.y = w.y - (sy - r.top) / this.cam.z; this.applyCam(); }
+  viewCenter() { const r = this.stage.getBoundingClientRect(); return { x: this.cam.x + r.width / 2 / this.cam.z, y: this.cam.y + r.height / 2 / this.cam.z }; }
+  bounds() {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    const add = e => { if (e.hidden) return; const x = e.offsetLeft, y = e.offsetTop; x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x + e.offsetWidth); y1 = Math.max(y1, y + e.offsetHeight); };
+    this.objs.forEach(o => add(o.el)); this.drafts.forEach(g => add(g.el)); add(this.inbox);
+    return isFinite(x0) ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+  }
+  fit() {
+    const b = this.bounds(), r = this.stage.getBoundingClientRect(); if (!b || !r.width) return;
+    const z = Math.max(0.15, Math.min(1.1, Math.min((r.width - 80) / b.w, (r.height - 170) / b.h)));
+    this.cam.z = z; this.cam.x = b.x - (r.width / z - b.w) / 2; this.cam.y = b.y - Math.max(64 / z, Math.min((r.height / z - b.h) / 2, 110 / z)); this.applyCam();
+  }
+  center(e) { const r = this.stage.getBoundingClientRect(); this.cam.x = e.offsetLeft + e.offsetWidth / 2 - r.width / 2 / this.cam.z; this.cam.y = e.offsetTop + Math.min(e.offsetHeight, r.height / this.cam.z * 0.6) / 2 - r.height / 2 / this.cam.z + 40 / this.cam.z; this.applyCam(); }
+  freeSpot(w, h, origin) {
+    const c = this.viewCenter(); let x = origin ? Math.round(origin.x) : Math.round(c.x - w / 2), y = origin ? Math.round(origin.y) : Math.round(c.y - h / 2 - 40), i = 0;
+    const now = performance.now(); this.reserved = (this.reserved || []).filter(r => r.until > now);
+    const rects = [...this.objs.values()].map(o => o.el).concat([...this.drafts.values()].map(g => g.el), [this.inbox]).map(e => ({ x: e.offsetLeft, y: e.offsetTop, w: e.offsetWidth, h: e.offsetHeight })).concat(this.reserved);
+    const hit = (x, y) => rects.some(r => x < r.x + r.w + 16 && x + w + 16 > r.x && y < r.y + r.h + 16 && y + h + 16 > r.y);
+    // walk outwards on a spiral of slots until the rectangle is clear
+    const step = Math.max(w, 220) + 32, rowH = Math.max(h, 120) + 32, x0 = x, y0 = y;
+    const slots = [[0, 0]]; for (let r = 1; r < 6; r++) for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) if (Math.max(Math.abs(dx), Math.abs(dy)) === r) slots.push([dx, dy]);
+    for (const [dx, dy] of slots) { x = x0 + dx * step; y = y0 + dy * rowH; if (!hit(x, y)) break; i++; }
+    return { x, y };
+  }
+  /* hold a spot for something about to land (a draft, a file in flight) */
+  reserve(x, y, w, h) { (this.reserved = this.reserved || []).push({ x, y, w, h, until: performance.now() + 20000 }); }
+  /* someone else drags a window: it follows their hand until they let go and the store has the new place */
+  remoteMove(id, r) {
+    if (r) this.remoteDrag.set(id, r); else this.remoteDrag.delete(id);
+    const o = this.objs.get(id), f = Store.files.get(id); if (!o || !f || (this.drag && this.drag.id === id)) return;
+    const e = o.el, x = r ? r.x : f.x, y = r ? r.y : f.y; e.style.left = (x || 0) + "px"; e.style.top = (y || 0) + "px";
+    if (f.type !== "note") { const d = DEFAULT_SIZE[f.type] || [300, 220]; e.style.width = ((r && r.w) || f.w || d[0]) + "px"; e.style.height = ((r && r.h) || f.h || d[1]) + "px"; }
+    e.classList.toggle("remote-moving", !!r);
+  }
+  /* ---------- apps: compile with cache ---------- */
+  compileApp(f) {
+    let a = this.apps.get(f.id); if (!a) { a = { view: new AppView(this, f.id) }; this.apps.set(f.id, a); }
+    // code someone else wrote is not even compiled (compiling runs it) until this person trusts it
+    if (!T.Trust.trusted(f)) { a.untrusted = true; a.key = null; a.good = null; a.compiled = { errors: [], warnings: [], ir: null, session: null }; return a; }
+    a.untrusted = false;
+    const params = this.o.paramsFor(f.id), key = String(f.content) + "\u0000" + T.stable(params);
+    if (a.key !== key) { a.key = key; a.compiled = T.compile(String(f.content || ""), params); if (!a.compiled.errors.length) { a.good = a.compiled; a.view.errors.clear(); } a.sig = null; }
+    return a;
+  }
+  /* ---------- streams claim notes that are not placed by hand ---------- */
+  claim(appFiles) {
+    const notes = this.notesCache, claims = new Map(), owner = new Map();
+    const free = notes.filter(t => !t.placed).sort((a, b) => (b.at || 0) - (a.at || 0));
+    const streams = [];
+    for (const f of appFiles) { const a = this.apps.get(f.id); if (!a || !a.good || !a.good.session.space) continue; const s = a.good.session; const walk = id => { const n = s.byId[id]; if (!n) return; if (n.type === "stream") streams.push({ app: f.id, n }); n.kids.forEach(walk); }; s.space.root.kids.forEach(walk); }
+    const take = (st, pick) => { let got = free.filter(t => !owner.has(t.id) && pick(t)); if (st.n.props.filter.last) got = got.slice(0, st.n.props.filter.last); got.forEach(t => owner.set(t.id, st)); claims.set(st.app + ":" + st.n.id, got); };
+    for (const st of streams) if (!st.n.props.filter.unsorted) take(st, t => T.matches(t, st.n.props.filter));
+    for (const st of streams) if (st.n.props.filter.unsorted) take(st, () => true);
+    this.claims = claims; this.owner = owner; this.leftover = free.filter(t => !owner.has(t.id));
+  }
+  filesFor(f) { return Store.list().filter(x => x.type !== "note" && (!f.type || [].concat(f.type).includes(x.type)) && (!f.name || x.name.toLowerCase().includes(String(f.name).toLowerCase())) && (!f.tag || (x.tags || []).includes(f.tag)) && (f.placed === undefined || !!x.placed === f.placed)); }
+  /* ---------- reconcile the store into objects ---------- */
+  sync() {
+    this.notesCache = Store.notes();
+    const files = Store.list(), apps = files.filter(f => f.type === "app" && f.placed);
+    apps.forEach(f => this.compileApp(f));
+    this.claim(apps);
+    const want = new Set();
+    for (const f of files) {
+      if (!f.placed) continue;
+      want.add(f.id);
+      let o = this.objs.get(f.id);
+      if (o && o.type !== f.type) { o.el.remove(); this.objs.delete(f.id); o = null; }
+      // one file that cannot be drawn never takes the rest of the desktop with it
+      try {
+        if (!o) {
+          o = this.makeObj(f); this.objs.set(f.id, o); this.world.append(o.el);
+          if (this.booted) { const cls = f.by !== "you" && Date.now() - (f.at || 0) < 6000 ? "landed" : "entered"; o.el.classList.add(cls); setTimeout(() => o.el.classList.remove(cls), 1000); }
+        }
+        this.updateObj(o, f);
+      } catch (e) { console.warn("Could not draw", f.id, e); }
+    }
+    for (const [id, o] of this.objs) if (!want.has(id)) { o.el.remove(); this.objs.delete(id); if (this.sel === id) this.select(null); }
+    for (const [id] of this.apps) if (!Store.files.has(id)) this.apps.delete(id);
+    // inbox
+    if (Store.ready) this.booted = true; // from now on, new windows animate in
+    this.inbox.hidden = !this.leftover.length; // the inbox appears when there is something to sort
+    const ib = Store.desk().inbox || [-300, 0];
+    this.inbox.style.left = ib[0] + "px"; this.inbox.style.top = ib[1] + "px";
+    const body = this.inbox.querySelector(".inbox-body"), sig = this.leftover.map(t => t.id + t.updated + (t.fresh ? "f" : "")).join(",") + (this.leftover.length ? "" : "empty");
+    if (body.dataset.sig !== sig || !this.leftover.length) {
+      body.dataset.sig = sig;
+      body.replaceChildren(...(this.leftover.length ? this.leftover.map(t => noteCard(Object.assign({ updated: 0 }, t, { at: t.at }))) : [el("div", { class: "empty" }, "Captures land here. Type below, or double-click anywhere on the desktop.")]));
+    }
+    this.inbox.querySelector(".zc").textContent = this.leftover.length ? String(this.leftover.length) : "";
+    this.markSel();
+  }
+  makeObj(f) {
+    if (f.type === "note") { const o = { type: "note", el: el("div", { class: "obj obj-note" }) }; return o; }
+    const head = el("header", { class: "obj-head", "data-drag": "obj" }, appTile(iconKind(f), 16), el("span", { class: "nm", title: "Double-click to rename" }), el("span", { class: "ty" }), el("span", { class: "grow" }));
+    const body = el("div", { class: "obj-body" }), grip = el("span", { class: "grip", "data-drag": "resize", "aria-hidden": "true" });
+    const o = { type: f.type, el: el("section", { class: "obj t-" + f.type, "data-id": f.id }, head, body, grip), head, body };
+    if (f.type === "app") {
+      o.mode = "app";
+      o.toggle = el("button", { type: "button", class: "btn sm ghost", "data-act": "code", title: "Show the program", hidden: devMode() ? null : true }, "Code");
+      // a built-in app is changed in place: Edit turns the app into its own editor
+      o.editBtn = el("button", { type: "button", class: "btn sm ghost edit-btn", "aria-pressed": "false", hidden: true, title: "Change what is in this app" }, "Edit");
+      o.editBtn.addEventListener("click", e => { e.stopPropagation(); this.setEditing(f.id, this.editing.get(f.id) ? null : "edit"); });
+      head.append(o.editBtn, o.toggle);
+      o.appBody = el("div", { class: "app-body" }); o.codeBody = el("div", { class: "code-body", hidden: true }); o.banner = el("div", { class: "app-banner", hidden: true }); o.paramsEl = el("div", { class: "app-params", hidden: true });
+      body.append(o.banner, o.appBody, o.codeBody); o.el.insertBefore(o.paramsEl, grip);
+      o.toggle.addEventListener("click", e => { e.stopPropagation(); this.setMode(o, f.id, o.mode === "app" ? "code" : "app"); });
+    } else if (f.type === "program") {
+      o.runBtn = el("button", { type: "button", class: "btn sm run-btn", title: "Run (⌘/Ctrl + Enter in the code)" }, "Run");
+      head.append(o.runBtn);
+      o.desc = el("div", { class: "prog-desc" });
+      o.editor = new Editor({ onChange: () => { o.dirty = true; clearTimeout(o.t); o.t = setTimeout(() => this.saveProgram(o, f.id), 600); this.markProgram(o); }, onRun: () => this.toggleRun(o, f.id) });
+      o.editor.ta.setAttribute("aria-label", "Program source");
+      o.req = el("div", { class: "app-banner prog-req", hidden: true });
+      o.pstatus = el("div", { class: "pstatus" }); o.console = el("div", { class: "console", role: "log", "aria-label": "Program output" });
+      body.append(el("div", { class: "prog" }, o.req, o.desc, o.editor.el, o.pstatus, o.console));
+      o.editor.el.hidden = !devMode(); o.desc.hidden = devMode();
+      o.runBtn.addEventListener("click", e => { e.stopPropagation(); this.toggleRun(o, f.id); });
+      o.editor.set(String(f.content || "")); o.synced = String(f.content || ""); this.markProgram(o);
+    } else {
+      o.ed = editorFor(f.type, f.content, (v, base) => Store.update(f.id, { content: v }, "you", "edit", undefined, { base }), { label: f.name, markdown: f.type === "doc" });
+      body.append(o.ed.el);
+    }
+    o.focusBtn = el("button", { type: "button", class: "ibtn focus-btn", "aria-label": "Focus", "data-tip": "Focus · F" }, svgIcon("focus"));
+    o.focusBtn.addEventListener("click", e => { e.stopPropagation(); this.o.toggleFocus && this.o.toggleFocus(f.id); });
+    head.append(o.focusBtn);
+    o.more = el("button", { type: "button", class: "ibtn more-btn", "aria-label": "Window menu", "aria-haspopup": "menu", "data-tip": "More" }, svgIcon("more"));
+    o.more.addEventListener("click", e => { e.stopPropagation(); const r = o.more.getBoundingClientRect(); this.o.windowMenu && this.o.windowMenu(f.id, r.right - 200, r.bottom + 4); });
+    head.append(o.more);
+    return o;
+  }
+  updateObj(o, f) {
+    const e = o.el;
+    if (!(this.drag && this.drag.id === f.id && (this.drag.mode === "obj" || this.drag.mode === "resize"))) {
+      const rd = this.remoteDrag.get(f.id); // someone else is moving it: follow their hand, not the stored place
+      e.style.left = ((rd ? rd.x : f.x) || 0) + "px"; e.style.top = ((rd ? rd.y : f.y) || 0) + "px";
+      if (f.type !== "note") { const d = DEFAULT_SIZE[f.type] || [300, 220]; e.style.width = ((rd && rd.w) || f.w || d[0]) + "px"; e.style.height = ((rd && rd.h) || f.h || d[1]) + "px"; }
+    }
+    if (f.type === "note") {
+      const sig = [f.content, f.kind, (f.tags || []).join(), f.done, f.by, f.at, (f.links || []).join(), f.url, f.fresh].join("|");
+      if (o.sig !== sig && !focusedIn(e)) { o.sig = sig; const n = this.notesCache.find(t => t.id === f.id); e.replaceChildren(noteCard(n)); }
+      return;
+    }
+    e.classList.toggle("fresh", !!f.fresh);
+    o.head.querySelector(".nm").textContent = f.name; o.head.querySelector(".ty").textContent = f.kit && T.KITS[f.kit] ? (f.kit === "site" ? "Website" : T.KITS[f.kit].title) : TYPE_LABEL[f.type] || f.type;
+    if (f.type === "program") { if (o.desc) o.desc.textContent = (String(f.content || "").match(/^\s*\/\/[^·\n]*·\s*(.+)/) || [])[1] || "A program. Press Run to start it."; this.syncProgram(o, f); return; }
+    if (o.editBtn) { const ed = this.editing.get(f.id), can = !!(f.kit && T.KITS[f.kit] && !["canvas", "records", "slides"].includes(f.kit)); o.editBtn.hidden = !can && !ed; o.editBtn.textContent = ed ? "Done" : "Edit"; o.editBtn.setAttribute("aria-pressed", String(!!ed)); o.el.classList.toggle("editing", !!ed); }
+    if (f.type !== "app") { o.ed.set(f.content); return; }
+    // app: program + data signature decides when to rebuild
+    const a = this.apps.get(f.id), comp = a && a.good;
+    if (a && a.untrusted) {
+      const sig = "untrusted:" + T.fnv1a(String(f.content)) + (Store.peopleV || 0);
+      if (o.trustSig !== sig) { o.trustSig = sig; a.sig = null; o.banner.hidden = true; if (o.mode === "code") this.setMode(o, f.id, "app"); o.appBody.replaceChildren(trustPanel(f, () => this.sync())); }
+      return;
+    }
+    if (o.trustSig) { o.trustSig = null; a.sig = null; }
+    if (o.mode === "code") this.syncCode(o, f, a);
+    o.banner.hidden = !(a && a.compiled.errors.length);
+    if (a && a.compiled.errors.length) { const er = a.compiled.errors[0].toJSON(); o.banner.replaceChildren(el("span", null, devMode() ? `Line ${er.line ?? "?"}: ${er.message}` : "Something in this app does not work yet."), el("button", { type: "button", class: "btn sm", onclick: ev => { ev.stopPropagation(); if (this.o.toClaude) this.o.toClaude(`The app “${f.name}” has a problem. Please fix it.`, { problem: er.message, line: er.line }, f.name); } }, "Fix with Claude"), devMode() ? el("button", { type: "button", class: "btn sm ghost", onclick: ev => { ev.stopPropagation(); this.setMode(o, f.id, "code", er.line); } }, "Show code") : null); }
+    if (!comp) { if (!o.appBody.firstChild) o.appBody.replaceChildren(el("div", { class: "empty pad" }, "This app is empty. Ask Claude below what it should do.")); return; }
+    if (comp.library) { const ls = comp.ir.hash + comp.library.join(); if (o.libSig !== ls) { o.libSig = ls; a.sig = null; o.appBody.replaceChildren(el("div", { class: "lib" }, el("div", { class: "lib-h" }, "Library"), el("p", null, "Other apps use these with ", el("code", null, `const { … } = include("${f.name}")`), "."), el("div", { class: "lib-x" }, ...comp.library.map(k => el("span", { class: "badge" }, k))))); } return; }
+    const sig = this.appSig(f.id, comp);
+    // rebuild when program or data change, except under someone's cursor (a clicked button does not count)
+    if (a.sig !== sig && !typingIn(o.appBody)) { a.sig = sig; a.view.render(comp, o.appBody); this.renderParams(o, f.id, comp); }
+  }
+  appSig(id, comp) {
+    const parts = [comp.ir.hash, T.stable(this.o.paramsFor(id)), this.editing.get(id) || ""];
+    for (const [k, list] of this.claims) if (k.startsWith(id + ":")) parts.push(k + "=" + list.map(t => t.id + ":" + t.kind + ":" + t.text.length + ":" + t.done + ":" + (t.tags || []).join("") + ":" + (t.links || []).length).join(","));
+    const s = comp.session;
+    for (const [name, ref] of Object.entries(s.files)) {
+      const f = Store.byName(name, ref.type); parts.push(name + "@" + (f ? f.updated : 0));
+      // what people did in it (votes, answers) and their names redraw a built-in app too
+      const sc = f && Store.marks.size ? Store.markScope("f", f.id) : null; if (sc && Store.marks.has(sc)) parts.push(sc + "=" + T.stable(Store.marksFor(sc).map(m => [m.id, m.v])) + "#" + (Store.peopleV || 0));
+    }
+    if (s.nodes.some(n => n.type === "files")) parts.push(Store.list().filter(f => f.type !== "note").map(f => f.id + f.name + f.placed).join(","));
+    return parts.join("|");
+  }
+  renderParams(o, id, comp) {
+    const ps = comp.ir.params; o.paramsEl.hidden = !ps.length; o.paramsEl.replaceChildren();
+    for (const p of ps) {
+      let ctl; const set = v => this.o.setParam(id, p.name, v);
+      if (p.control === "slider") { const out = el("output", null, String(p.value)); const r = el("input", { type: "range", min: p.min, max: p.max, step: p.step, value: p.value, "aria-label": p.name }); r.addEventListener("input", () => { out.textContent = r.value; }); r.addEventListener("change", () => set(Number(r.value))); ctl = el("span", { class: "pk" }, el("label", null, p.name), r, out); }
+      else if (p.control === "checkbox") { const b = el("button", { type: "button", class: "switch", role: "switch", "aria-checked": String(!!p.value), "aria-label": p.name, onclick: () => set(!p.value) }); ctl = el("span", { class: "pk" }, el("label", null, p.name), b); }
+      else if (p.control === "choice") { const sel = el("select", { "aria-label": p.name }, ...p.options.map(x => el("option", { value: x, selected: x === p.value }, x))); sel.addEventListener("change", () => set(sel.value)); ctl = el("span", { class: "pk" }, el("label", null, p.name), sel); }
+      else { const t = el("input", { type: "text", value: p.value, "aria-label": p.name }); t.addEventListener("change", () => set(t.value)); ctl = el("span", { class: "pk" }, el("label", null, p.name), t); }
+      o.paramsEl.append(ctl);
+    }
+  }
+  /* ---------- a program's editor, console and run button ---------- */
+  saveProgram(o, id) { clearTimeout(o.t); const f = Store.files.get(id); if (!f) return; const v = o.editor.value; o.dirty = false; o.synced = v; if (v !== String(f.content || "")) Store.update(id, { content: v }, "you", "program"); }
+  markProgram(o) { const er = checkProgram(o.editor.value); o.editor.mark(er && er.line ? [er.line] : []); o.synErr = er; }
+  toggleRun(o, id) {
+    if (this.runner.running(id)) { this.runner.stop(id); return; } if (o.dirty) this.saveProgram(o, id);
+    const f = Store.files.get(id);
+    if (f && !T.Trust.trusted(f)) { o.req.hidden = false; o.req.replaceChildren(trustPanel(f, () => { o.req.hidden = true; o.req.replaceChildren(); this.runner.run(id, { by: "you" }); this.sync(); }, true)); return; }
+    this.runner.run(id, { by: "you" }); this.sync();
+  }
+  syncProgram(o, f) {
+    const remote = String(f.content || "");
+    if (remote !== o.synced) { if (!o.dirty || o.editor.value === o.synced) { o.editor.set(remote); o.synced = remote; o.dirty = false; this.markProgram(o); } else o.conflict = { by: f.eby || f.by, who: f.ewho || f.who }; }
+    const mine = this.runner.running(f.id), theirs = !mine && f.status === "running" && Date.now() - (f.ranAt || 0) < 10 * 60 * 1000;
+    o.runBtn.textContent = mine ? "Stop" : "Run"; o.runBtn.classList.toggle("running", mine || theirs);
+    const outSig = (f.output || []).length + ":" + ((f.output || []).slice(-1)[0] || {}).at + ":" + f.status;
+    if (o.outSig !== outSig) {
+      o.outSig = outSig; const lines = f.output || [];
+      o.console.replaceChildren(...(lines.length ? lines.map(l => el("div", { class: "ln " + (l.kind || "out") }, l.text)) : [el("div", { class: "ln quiet" }, "Output appears here. Press Run.")]));
+      o.console.scrollTop = o.console.scrollHeight;
+    }
+    const when = f.ranAt ? new Date(f.ranAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+    const who = f.ranBy ? Store.label(f.ranBy, f.ranWho) : "";
+    o.pstatus.className = "pstatus" + (o.synErr ? " bad" : mine || theirs ? " live" : f.status === "error" ? " bad" : "");
+    o.pstatus.textContent = o.synErr ? `Line ${o.synErr.line ?? "?"}: ${o.synErr.message}` : mine || theirs ? `Running · started by ${who} at ${when}` : f.status === "done" ? `Finished in ${((f.took || 0) / 1000).toFixed(1)} s · ${who} · ${when}` : f.status === "error" ? `Failed · ${who} · ${when}` : f.status === "stopped" ? `Stopped · ${who} · ${when}` : "Not run yet";
+    if (o.conflict) o.pstatus.append(" · ", el("button", { type: "button", class: "btn sm", onclick: () => { o.editor.set(String((Store.files.get(f.id) || {}).content || "")); o.synced = o.editor.value; o.dirty = false; o.conflict = null; this.markProgram(o); this.sync(); } }, `Load ${o.conflict ? Store.label(o.conflict.by, o.conflict.who) + "’s" : "their"} version`));
+    const req = f.runRequest && (f.runRequest.at || 0) > (f.ranAt || 0) && !mine;
+    o.req.hidden = !req;
+    if (req && !o.req.firstChild) o.req.replaceChildren(el("span", null, `${Store.label(f.runRequest.by || "claude", f.runRequest.who)} asks to run this program.`), el("button", { type: "button", class: "btn sm primary", onclick: ev => { ev.stopPropagation(); this.runner.run(f.id, { by: "you", input: f.runRequest.input }); } }, "Run it"), el("button", { type: "button", class: "btn sm ghost", onclick: ev => { ev.stopPropagation(); Store.update(f.id, { runRequest: null }, "you", false); } }, "Dismiss"));
+    if (!req) o.req.replaceChildren();
+  }
+  /* ---------- a built-in app's Edit mode ("edit") or its text ("text") ---------- */
+  setEditing(id, mode) {
+    if (mode) this.editing.set(id, mode); else this.editing.delete(id);
+    const a = this.apps.get(id); if (a) a.sig = null;
+    const o = this.objs.get(id); if (o && o.mode === "code") this.setMode(o, id, "app");
+    this.sync();
+  }
+  /* ---------- an app's code view ---------- */
+  setMode(o, id, mode, line) {
+    o.mode = mode; o.appBody.hidden = mode !== "app"; o.codeBody.hidden = mode !== "code";
+    o.toggle.textContent = mode === "app" ? "Code" : "App"; o.toggle.title = mode === "app" ? "Show the program" : "Show the app";
+    const f = Store.files.get(id);
+    if (mode === "code") {
+      if (!o.editor) {
+        o.problems = el("div", { class: "code-problems" }); o.status = el("div", { class: "code-status" });
+        o.editor = new Editor({ onChange: code => { o.dirty = true; clearTimeout(o.t); o.t = setTimeout(() => this.applyCode(o, id, code), 350); }, onRun: () => this.applyCode(o, id, o.editor.value) });
+        o.codeBody.append(o.editor.el, o.problems, o.status);
+        o.editor.set(String(f.content || "")); o.synced = String(f.content || "");
+      }
+      this.syncCode(o, f, this.apps.get(id));
+      if (line) setTimeout(() => o.editor.goto(line), 0);
+    } else { this.sync(); }
+  }
+  syncCode(o, f, a) {
+    if (!o.editor) return;
+    const remote = String(f.content || "");
+    if (remote !== o.synced) { if (!o.dirty || o.editor.value === o.synced) { o.editor.set(remote); o.synced = remote; o.dirty = false; } else { o.status.replaceChildren(el("span", null, `${Store.label(f.eby || f.by, f.ewho || f.who)} changed this program.`), el("button", { type: "button", class: "btn sm", onclick: () => { o.editor.set(remote); o.synced = remote; o.dirty = false; this.applyCode(o, f.id, remote); } }, "Load theirs")); return; } }
+    const comp = o.dirty && o.localCompiled ? o.localCompiled : a && a.compiled;
+    const errs = (comp ? comp.errors.map(e => e.toJSON()) : []).concat(!o.dirty && a ? [...a.view.errors.values()] : []);
+    o.editor.mark(errs.map(e => e.line));
+    o.problems.replaceChildren(...errs.slice(0, 6).map(er => { const r = el("div", { class: "problem", role: "button", tabindex: "0" }, el("b", null, er.line != null ? "L" + er.line : "—"), el("span", null, er.message), er.hint ? el("small", null, er.hint) : null); r.addEventListener("click", () => er.line && o.editor.goto(er.line)); return r; }));
+    o.problems.hidden = !errs.length;
+    const ir = comp && !comp.errors.length ? comp.ir : a && a.good && a.good.ir;
+    o.status.textContent = comp && comp.errors.length ? `${comp.errors.length} problem${comp.errors.length > 1 ? "s" : ""} · the app shows the last good build` : ir ? `Built “${ir.title}” · ${ir.nodes.length} nodes · ${ir.lambdas.length} lambdas · #${ir.hash.slice(0, 6)}` : "";
+  }
+  applyCode(o, id, code) {
+    clearTimeout(o.t); const f = Store.files.get(id); if (!f) return;
+    const c = T.compile(code, this.o.paramsFor(id)); o.localCompiled = c;
+    if (c.errors.length) { this.syncCode(o, f, this.apps.get(id)); return; }
+    o.synced = code; o.dirty = false;
+    if (code !== String(f.content)) Store.update(id, { content: code, name: c.ir.title || f.name }, "you", "program"); else this.syncCode(o, f, this.apps.get(id));
+  }
+  /* ---------- writing files from apps ---------- */
+  /* base: the content the change was made from, when that may be older than what the file holds now */
+  writeFile(name, v, view, type, what, base) {
+    const ref = view && view.compiled && view.compiled.session.files[name], f = Store.byName(name, type || (ref && ref.type) || null);
+    const cur = f ? clone(f.content) : ref ? clone(ref.seed) : undefined;
+    const next = typeof v === "function" ? v(cur) : v;
+    const app = view ? Store.files.get(view.appId) : null;
+    if (f) return Store.update(f.id, { content: clone(next) }, "you", what ? "act" : "edit", what ? `${app ? app.name : String(name).replace(/ · data$/, "")}: ${what}` : undefined, base !== undefined && typeof v !== "function" ? { base } : undefined);
+    const t = type || (ref && ref.type) || (typeof next === "string" ? "doc" : Array.isArray(next) ? "list" : "data");
+    return Store.add({ name, type: t, content: clone(next), placed: false }, "you", "create" + (app ? "" : ""));
+  }
+  openFile(id, nearApp) {
+    const f = Store.files.get(id); if (!f) return;
+    if (!f.placed) { const a = nearApp && this.objs.get(nearApp), d = DEFAULT_SIZE[f.type] || [300, 220]; const pos = a ? { x: a.el.offsetLeft + a.el.offsetWidth + 32, y: a.el.offsetTop } : this.freeSpot(d[0], d[1]); Store.update(id, { placed: true, x: pos.x, y: pos.y }, "you", "open"); setTimeout(() => this.reveal(id), 30); }
+    else this.reveal(id);
+  }
+  reveal(id) { const o = this.objs.get(id); if (!o) return; this.select(id); this.center(o.el); }
+  /* ---------- selection ---------- */
+  select(id) {
+    this.sel = id || null; this.markSel(); this.o.onSelect && this.o.onSelect(this.sel);
+    const f = id && Store.files.get(id); if (f && f.fresh) Store.update(id, { fresh: false }, "you", false); // seen
+  }
+  markSel() { this.objs.forEach((o, id) => o.el.classList.toggle("sel", id === this.sel)); this.world.querySelectorAll(".card.sel").forEach(c => c.classList.remove("sel")); if (this.sel) this.world.querySelectorAll(`[data-note="${CSS.escape(String(this.sel))}"]`).forEach(c => c.classList.add("sel")); }
+  elFor(id) { const o = this.objs.get(id); if (o) return o.el; return this.world.querySelector(`[data-note="${CSS.escape(String(id))}"]`); }
+  /* ---------- per frame ---------- */
+  frame(now) {
+    const t = (now - this.t0) / 1000; this.dt = t - this.t; this.t = t; this.frameN++;
+    if (this.camAnim) { const k = Math.min(1, (now - this.camAnim.t0) / 420), e = 1 - Math.pow(1 - k, 3), A = this.camAnim; this.cam.x = A.from.x + (A.to.x - A.from.x) * e; this.cam.y = A.from.y + (A.to.y - A.from.y) * e; this.applyCam(); if (k >= 1) this.camAnim = null; }
+    for (const g of this.drafts.values()) if (g.dirty) this.paintDraft(g);
+    if (document.hidden || !this.o.active()) return;
+    for (const [id, a] of this.apps) { const o = this.objs.get(id); if (a.good && o && o.mode !== "code" && a.view.root) a.view.frame(); }
+    this.drawNoteLinks();
+    this.o.onFrame && this.o.onFrame();
+  }
+  drawNoteLinks() {
+    const links = []; for (const t of this.notesCache) for (const to of t.links || []) links.push([t.id, to]);
+    const d = this.drag;
+    if (!links.length && !(d && d.mode === "link")) { if (this.svg.innerHTML) this.svg.innerHTML = ""; return; }
+    const wr = this.world.getBoundingClientRect(), z = this.cam.z, K = this.o.tokens();
+    const box = id => { const e = this.world.querySelector(`[data-note="${CSS.escape(String(id))}"]`); if (!e) return null; const r = e.getBoundingClientRect(); return { x: (r.left - wr.left) / z, y: (r.top - wr.top) / z, w: r.width / z, h: r.height / z }; };
+    let out = "";
+    for (const [a, b] of links) { const A = box(a), B = box(b); if (A && B) out += linkPath(A, B, "", K, true); }
+    if (d && d.mode === "link" && d.moved) { const A = box(d.id); if (A) { const w = this.toWorld(d.sx, d.sy); out += `<path d="M${A.x + A.w},${A.y + A.h / 2} L${w.x},${w.y}" stroke="${K.accent}" stroke-dasharray="4 3" stroke-width="1.5" fill="none"/>`; } }
+    this.svg.innerHTML = out;
+  }
+  /* ==========================================================================
+     DRAFTS · what Claude is writing right now, drawn where it will land.
+     A draft is not a file: it lives only on screen, fills as tokens arrive
+     and is replaced by the real file the moment its block closes.
+     ========================================================================== */
+  draft(key, d) {
+    let g = this.drafts.get(key);
+    if (!g) {
+      const note = d.type === "note" || d.op === "append" && false;
+      const elx = el("section", { class: "obj draft" + (note ? " draft-note" : " t-" + (d.type || "doc")), "aria-label": `Claude is writing ${d.name || "a note"}` });
+      g = { key, el: elx, note, spec: d, dirty: true, born: performance.now() };
+      if (note) { g.card = el("div", { class: "card draft-card k-" + (d.kind || "note") }); elx.append(g.card); }
+      else {
+        g.nm = el("span", { class: "nm" }); g.ty = el("span", { class: "ty" });
+        g.body = el("div", { class: "obj-body draft-body" });
+        elx.append(el("header", { class: "obj-head" }, el("i", { class: "fg" }), g.nm, g.ty, el("span", { class: "grow" }), el("span", { class: "writing" }, el("i"), d.who || "Claude")), g.body);
+      }
+      this.world.append(elx); this.drafts.set(key, g);
+    }
+    g.spec = d; g.dirty = true; g.el.setAttribute("aria-label", `${d.who || "Claude"} is writing ${d.name || "a note"}`);
+    return g;
+  }
+  paintDraft(g) {
+    g.dirty = false; const d = g.spec, e = g.el;
+    e.style.left = (d.x || 0) + "px"; e.style.top = (d.y || 0) + "px";
+    e.classList.toggle("closing", !!d.closed);
+    if (g.note) {
+      const text = String(d.body || "");
+      g.card.className = "card draft-card k-" + (d.kind || "note");
+      g.card.replaceChildren(el("div", { class: "eye" }, el("i", { class: "g" }), (KIND_LABEL[d.kind] || "Note") + " · " + (d.who || "Claude") + " is writing"), el("div", { class: "txt" }, text, el("span", { class: "caret" })), (d.tags || []).length ? el("div", { class: "meta" }, el("span", { class: "tags" }, d.tags.map(t => "#" + t).join(" "))) : null);
+      return;
+    }
+    const K = d.kit && T.KITS[d.kit], sz = K ? K.size : DEFAULT_SIZE[d.type] || [320, 240];
+    e.style.width = (d.w || sz[0]) + "px"; e.style.height = (d.h || sz[1]) + "px";
+    g.nm.textContent = d.name || (K ? K.title : "Untitled"); g.ty.textContent = d.op === "append" ? "Adding" : d.edit ? "Rewriting" : K ? K.title : TYPE_LABEL[d.type] || "";
+    const b = g.body, body = String(d.body || ""), caret = () => el("span", { class: "caret" });
+    let view;
+    if (K && KIT_VIEWS[d.kit]) { try { view = KIT_VIEWS[d.kit](K.parse(body, d.variant), { preview: true, write() {}, claude() {} }); } catch (err) { view = el("div", { class: "k-empty" }, "…"); } }
+    else if (d.type === "app") view = appSkeleton(body, caret);
+    else if (d.type === "doc") { view = mdRender(body); view.append(caret()); }
+    else if (d.type === "list") { const items = T.decodeBody("list", body); view = el("ul", { class: "draft-list" }, ...items.map(it => el("li", null, el("i", { class: "chk" + (it.done ? " on" : "") }), el("span", { class: it.done ? "done" : "" }, it.text))), el("li", { class: "li-caret" }, caret())); }
+    else if (d.type === "table") { const rows = T.decodeBody("table", body, true), t = el("table"); rows.forEach((r, i) => t.append(el("tr", null, ...r.map(c => el(i ? "td" : "th", null, String(c)))))); view = el("div", { class: "draft-table" }, t, caret()); }
+    else view = el("pre", { class: "draft-text" + (d.type === "data" || d.type === "page" ? " mono" : "") }, body, caret());
+    b.replaceChildren(view); b.scrollTop = b.scrollHeight;
+  }
+  clearDraft(key) { const g = this.drafts.get(key); if (!g) return; this.drafts.delete(key); g.el.classList.add("gone"); setTimeout(() => g.el.remove(), 180); }
+  clearDrafts(prefix) { for (const k of [...this.drafts.keys()]) if (!prefix || k.startsWith(prefix)) this.clearDraft(k); }
+  /* bring a spot into view without a jump: an eased pan, zoom unchanged */
+  glideTo(x, y, w, h) {
+    const r = this.stage.getBoundingClientRect(), z = this.cam.z, vx = this.cam.x, vy = this.cam.y, vw = r.width / z, vh = r.height / z, m = 60 / z;
+    if (x >= vx + m && y >= vy + m && x + Math.min(w, vw - 2 * m) <= vx + vw - m && y + Math.min(h, vh * 0.5) <= vy + vh - 120 / z) return;
+    this.camAnim = { t0: performance.now(), from: { x: vx, y: vy }, to: { x: x + Math.min(w, vw) / 2 - vw / 2, y: y + Math.min(h, vh * 0.6) / 2 - vh / 2 + 30 / z } };
+  }
+  /* bring a file into view and make it glow for a moment: how Claude points at something */
+  spotlight(id, glide) {
+    const e = this.elFor(id); if (!e) return;
+    if (glide !== false) { const o = this.objs.get(id); if (o) this.glideTo(e.offsetLeft, e.offsetTop, e.offsetWidth, e.offsetHeight); }
+    e.classList.remove("spot"); void e.offsetWidth; e.classList.add("spot"); clearTimeout(e._spotT); e._spotT = setTimeout(() => e.classList.remove("spot"), 2200);
+    this.claudeAt(e.offsetLeft + Math.min(e.offsetWidth - 40, 48), e.offsetTop - 30);
+  }
+  /* Claude's place on the desktop: a small marker that moves to whatever it is working on */
+  claudeAt(x, y, what) {
+    if (!this.cc) { this.cc = el("div", { class: "claude-cursor", "aria-hidden": "true" }, el("i"), el("span", { class: "cc-who" }, "Claude"), el("span", { class: "cc-what" })); this.world.append(this.cc); }
+    const moved = !this.ccAt || Math.hypot(this.ccAt[0] - x, this.ccAt[1] - y) > 40; this.ccAt = [x, y];
+    this.cc.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`; this.cc.classList.add("on");
+    if (moved) { this.cc.classList.remove("arrive"); clearTimeout(this.ccA); this.ccA = setTimeout(() => { this.cc.classList.add("arrive"); setTimeout(() => this.cc && this.cc.classList.remove("arrive"), 850); }, 520); }
+    this.cc.querySelector(".cc-what").textContent = what ? " · " + what : "";
+    clearTimeout(this.ccT); this.ccT = setTimeout(() => this.cc && this.cc.classList.remove("on"), 9000);
+  }
+  /* ---------- gestures ---------- */
+  bind() {
+    const st = this.stage;
+    // focusing a field near the edge makes the browser scroll the stage; the camera does the moving here, so undo it
+    st.addEventListener("scroll", () => { if (st.scrollTop || st.scrollLeft) { st.scrollTop = 0; st.scrollLeft = 0; } });
+    const interactive = t => t.closest("textarea, input, select, a, [contenteditable], .code-body, .prog, iframe, .app-btn, .ed-list button, .tbl-bar, .ed-data button, .ed-link button, .file-tile, .btn, .switch, button, .sg-grid, .kd, .rt");
+    st.addEventListener("pointerdown", e => {
+      this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this.pointers.size === 2) { const [a, b] = [...this.pointers.values()]; this.drag = { mode: "pinch", dist: Math.hypot(a.x - b.x, a.y - b.y), z: this.cam.z, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 }; return; }
+      const objEl = e.target.closest(".obj");
+      const fid = objEl && objEl.dataset.id ? objEl.dataset.id : null;
+      if (e.button === 2) return;
+      const tog = e.target.closest('[data-act="toggle"]');
+      if (tog) { const id = tog.closest("[data-note]").dataset.note, f = Store.files.get(id); if (f) Store.update(id, { done: !f.done }, "you", f.done ? "reopen" : "done"); return; }
+      if (interactive(e.target)) { if (fid) this.select(fid); return; }
+      const dragEl = e.target.closest("[data-drag]"), kind = dragEl && dragEl.dataset.drag;
+      const base = { sx: e.clientX, sy: e.clientY, x0: e.clientX, y0: e.clientY, moved: false };
+      if (kind === "link") { this.drag = Object.assign(base, { mode: "link", id: dragEl.dataset.id }); st.setPointerCapture(e.pointerId); e.preventDefault(); return; }
+      if (kind === "note") { const id = dragEl.dataset.note; this.drag = Object.assign(base, { mode: "note", id, el: dragEl }); st.setPointerCapture(e.pointerId); return; }
+      if ((kind === "obj" || kind === "resize") && fid) { const f = Store.files.get(fid); this.drag = Object.assign(base, { mode: kind, id: fid, ox: objEl.offsetLeft, oy: objEl.offsetTop, ow: objEl.offsetWidth, oh: objEl.offsetHeight, el: objEl, f }); this.select(fid); st.setPointerCapture(e.pointerId); e.preventDefault(); return; }
+      if (kind === "inbox") { this.drag = Object.assign(base, { mode: "inbox", ox: this.inbox.offsetLeft, oy: this.inbox.offsetTop }); st.setPointerCapture(e.pointerId); return; }
+      if (fid) { this.select(fid); return; }
+      if (objEl) return;
+      this.camAnim = null; this.drag = Object.assign(base, { mode: "pan", cx: this.cam.x, cy: this.cam.y }); st.setPointerCapture(e.pointerId);
+    });
+    st.addEventListener("pointermove", e => {
+      if (this.pointers.has(e.pointerId)) this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const d = this.drag; if (!d) return;
+      if (d.mode === "pinch") { if (this.pointers.size === 2) { const [a, b] = [...this.pointers.values()], dist = Math.hypot(a.x - b.x, a.y - b.y); this.zoomAt(d.mx, d.my, (d.z * dist / d.dist) / this.cam.z); } return; }
+      d.sx = e.clientX; d.sy = e.clientY;
+      if (!d.moved && Math.hypot(e.clientX - d.x0, e.clientY - d.y0) > 4) { d.moved = true; if (d.mode === "note") this.startGhost(d); }
+      if (!d.moved) return;
+      const dx = (e.clientX - d.x0) / this.cam.z, dy = (e.clientY - d.y0) / this.cam.z;
+      if (d.mode === "pan") { this.cam.x = d.cx - dx; this.cam.y = d.cy - dy; this.applyCam(); st.classList.add("panning"); this.o.onUserCamera && this.o.onUserCamera(); }
+      else if (d.mode === "obj") { d.el.style.left = Math.round(d.ox + dx) + "px"; d.el.style.top = Math.round(d.oy + dy) + "px"; this.o.onDragMove && this.o.onDragMove({ id: d.id, x: d.el.offsetLeft, y: d.el.offsetTop }); }
+      else if (d.mode === "resize") { d.el.style.width = Math.max(220, Math.round(d.ow + dx)) + "px"; d.el.style.height = Math.max(120, Math.round(d.oh + dy)) + "px"; this.o.onDragMove && this.o.onDragMove({ id: d.id, x: d.el.offsetLeft, y: d.el.offsetTop, w: d.el.offsetWidth, h: d.el.offsetHeight }); }
+      else if (d.mode === "inbox") { this.inbox.style.left = Math.round(d.ox + dx) + "px"; this.inbox.style.top = Math.round(d.oy + dy) + "px"; }
+      else if (d.mode === "note") { d.ghost.style.transform = `translate(${e.clientX - d.gx}px, ${e.clientY - d.gy}px) scale(${this.cam.z})`; this.hotTarget(this.dropAt(e.clientX, e.clientY)); }
+    });
+    const up = e => {
+      this.pointers.delete(e.pointerId); st.classList.remove("panning");
+      const d = this.drag; this.drag = null; if (!d || d.mode === "pinch") return;
+      if ((d.mode === "obj" || d.mode === "resize") && d.moved && this.o.onDragMove) setTimeout(() => this.o.onDragMove(null), 250); // after the store has the new place
+      if (d.mode === "pan") { if (!d.moved) this.select(null); return; }
+      if (d.mode === "link") { const tEl = document.elementFromPoint(e.clientX, e.clientY), to = tEl && tEl.closest("[data-note]"); if (to && to.dataset.note !== d.id) { const f = Store.files.get(d.id); if (f && !(f.links || []).includes(to.dataset.note)) { Store.update(d.id, { links: (f.links || []).concat([to.dataset.note]) }, "you", false); Store.log("link", `${f.content} → ${(Store.files.get(to.dataset.note) || {}).content || ""}`, d.id, "you"); } } this.svg.innerHTML = ""; return; }
+      if (d.mode === "note") { if (!d.moved) { this.select(d.id); return; } this.endGhost(d, e); return; }
+      if (d.mode === "obj") { if (d.moved) Store.update(d.id, { x: d.el.offsetLeft, y: d.el.offsetTop }, "you", "arrange"); return; }
+      if (d.mode === "resize") { if (d.moved) Store.update(d.id, { w: d.el.offsetWidth, h: d.el.offsetHeight }, "you", false); return; }
+      if (d.mode === "inbox") { if (d.moved) Store.updateDesk({ inbox: [this.inbox.offsetLeft, this.inbox.offsetTop] }); }
+    };
+    st.addEventListener("pointerup", up); st.addEventListener("pointercancel", up);
+    st.addEventListener("dblclick", e => {
+      if (e.target.closest("textarea, input, [contenteditable], .code-body, button, a")) return;
+      const card = e.target.closest("[data-note]"); if (card) { this.editNote(card); return; }
+      const nm = e.target.closest(".obj-head .nm"); if (nm) { this.rename(nm.closest(".obj").dataset.id, nm); return; }
+      const hd = e.target.closest(".obj[data-id] > .obj-head"); if (hd) { this.o.toggleFocus && this.o.toggleFocus(hd.parentElement.dataset.id); return; }
+      const node = e.target.closest("[data-node]"), app = e.target.closest(".obj.t-app");
+      if (node && app && !devMode()) return;
+      if (node && app) { const o = this.objs.get(app.dataset.id), a = this.apps.get(app.dataset.id); const n = a && a.good && a.good.session.byId[node.dataset.node]; if (o && n) this.setMode(o, app.dataset.id, "code", n.line); return; }
+      if (e.target.closest(".obj")) return;
+      const w = this.toWorld(e.clientX, e.clientY); this.newNoteAt(w.x, w.y);
+    });
+    st.addEventListener("contextmenu", e => {
+      const ob = e.target.closest(".obj[data-id]");
+      if (ob && !e.target.closest("textarea, input, [contenteditable], .k-canvas.live .kv-board")) { e.preventDefault(); this.o.windowMenu && this.o.windowMenu(ob.dataset.id, e.clientX, e.clientY); return; }
+      if (e.target.closest(".obj, textarea, input, [contenteditable]")) return; e.preventDefault(); const w = this.toWorld(e.clientX, e.clientY); this.o.contextMenu && this.o.contextMenu(e.clientX, e.clientY, w); });
+    st.addEventListener("wheel", e => {
+      const scroller = e.target.closest(".console, .draft-body, .code-box, .code-ta, .ed-doc, .tbl-scroll, .kv-scroll, .ke-scroll, .kr-scroll, .ke-preview, textarea, .obj-body");
+      if (!e.ctrlKey && !e.metaKey && scroller && (scroller.scrollHeight > scroller.clientHeight + 1 || scroller.scrollWidth > scroller.clientWidth + 1)) return;
+      e.preventDefault(); this.camAnim = null; this.o.onUserCamera && this.o.onUserCamera();
+      if (e.ctrlKey || e.metaKey) this.zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.01));
+      else { this.cam.x += e.deltaX / this.cam.z; this.cam.y += e.deltaY / this.cam.z; this.applyCam(); }
+    }, { passive: false });
+    st.addEventListener("keydown", e => {
+      if (e.target.closest("textarea, input, [contenteditable]")) return;
+      if ((e.key === "Delete" || e.key === "Backspace") && this.sel) { e.preventDefault(); this.o.removeFile(this.sel); }
+      else if (e.key === "Enter" && this.sel) { const c = this.world.querySelector(`[data-note="${CSS.escape(String(this.sel))}"]`); if (c) { e.preventDefault(); this.editNote(c); } }
+      else if (e.key === "Escape") this.select(null);
+      else if (e.key === "f") this.fit();
+    });
+  }
+  startGhost(d) {
+    const r = d.el.getBoundingClientRect(), g = d.el.cloneNode(true);
+    g.classList.add("ghost"); g.style.width = d.el.offsetWidth + "px"; document.body.append(g);
+    d.gx = d.x0 - r.left; d.gy = d.y0 - r.top; d.ghost = g; d.el.classList.add("dragging");
+    g.style.transform = `translate(${d.x0 - d.gx}px, ${d.y0 - d.gy}px) scale(${this.cam.z})`;
+  }
+  dropAt(x, y) { const t = document.elementFromPoint(x, y); return t ? t.closest("[data-drop]") : null; }
+  hotTarget(t) { if (this.hot === t) return; if (this.hot) this.hot.classList.remove("drop-hot"); this.hot = t; if (t) t.classList.add("drop-hot"); }
+  endGhost(d, e) {
+    d.ghost.remove(); d.el.classList.remove("dragging"); this.hotTarget(null);
+    const target = this.dropAt(e.clientX, e.clientY), f = Store.files.get(d.id); if (!f) return;
+    const from = this.owner.get(d.id), fromAssign = from ? from.n.props.assign : null;
+    if (!target) {
+      const onObj = document.elementFromPoint(e.clientX, e.clientY); if (onObj && onObj.closest(".obj:not(.obj-note)")) return;
+      const w = this.toWorld(e.clientX - d.gx + 0, e.clientY - d.gy + 0);
+      Store.update(d.id, { placed: true, x: Math.round(w.x), y: Math.round(w.y) }, "you", false); Store.log("place", f.content, d.id, "you", f.kind); return;
+    }
+    let to = null, title = "Inbox";
+    if (target.dataset.drop !== "inbox") { const [appId, nodeId] = target.dataset.drop.split(":"); const a = this.apps.get(appId); const n = a && a.good && a.good.session.byId[nodeId]; if (!n) return; to = n.props.assign; if (from && from.app === appId && from.n.id === nodeId && !f.placed) return; const z = target.closest(".zone"); title = z ? z.querySelector(".zt").textContent : "stream"; }
+    let tags = (f.tags || []).slice(), kind = f.kind || "note";
+    if (fromAssign && fromAssign.tag && (!to || fromAssign.tag !== to.tag)) tags = tags.filter(x => x !== fromAssign.tag);
+    if ((!to || to.unsorted) && fromAssign && fromAssign.kind && kind === fromAssign.kind) kind = "note";
+    if (to && to.kind) kind = to.kind;
+    if (to && to.tag && !tags.includes(to.tag)) tags.push(to.tag);
+    Store.update(d.id, { placed: false, tags, kind }, "you", false); Store.log("move", `${f.content} → ${title}`, d.id, "you", kind);
+  }
+  /* ---------- inline note editing ---------- */
+  editNote(card) {
+    const id = card.dataset.note, f = Store.files.get(id); if (!f) return;
+    const txt = card.querySelector(".txt"), ta = el("textarea", { class: "note-edit", "aria-label": "Note text" });
+    ta.value = String(f.content || "") + ((f.tags || []).length ? " " + f.tags.map(t => "#" + t).join(" ") : "");
+    txt.replaceWith(ta); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+    const size = () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; }; size(); ta.addEventListener("input", size);
+    let done = false;
+    const finish = commit => {
+      if (done) return; done = true; const raw = ta.value.trim();
+      if (commit && raw) { const p = T.parseCapture(raw), explicit = /^(\?|!|=|\[|>|@)/.test(raw), patch = { content: p.text, tags: p.tags }; if (explicit) { patch.kind = p.kind; if (p.kind === "task") patch.done = p.done; } if (p.url) patch.url = p.url; Store.update(id, patch, "you", "edit"); }
+      const o = this.objs.get(id); if (o) o.sig = null; ta.replaceWith(txt); this.sync();
+    };
+    ta.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Escape") { e.preventDefault(); finish(false); } else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); finish(true); } });
+    ta.addEventListener("blur", () => finish(true));
+  }
+  newNoteAt(x, y, kind) {
+    const tmp = el("div", { class: "obj obj-note" }), card = el("div", { class: "card k-" + (kind || "note") }), ta = el("textarea", { class: "note-edit", placeholder: "A thought… ? ! = [] > @ #tag", "aria-label": "New note" });
+    card.append(ta); tmp.append(card); tmp.style.left = x + "px"; tmp.style.top = y + "px"; this.world.append(tmp); ta.focus();
+    let done = false;
+    const finish = commit => {
+      if (done) return; done = true; const raw = ta.value.trim(); tmp.remove();
+      if (commit && raw) { const p = T.parseCapture(raw); const f = Store.add(Object.assign({ type: "note", content: p.text, kind: kind && p.kind === "note" ? kind : p.kind, tags: p.tags, done: p.done, placed: true, x: Math.round(x), y: Math.round(y) }, p.url ? { url: p.url } : {}), "you"); this.select(f.id); }
+    };
+    ta.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Escape") finish(false); else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); finish(true); } });
+    ta.addEventListener("blur", () => finish(true));
+  }
+  rename(id, nm) {
+    const renameFile = (f, v) => {
+      if (f.type === "app" && f.kit && T.KITS[f.kit]) { if (Store.byName(v, "app")) { this.o.toast && this.o.toast(`There is already an app called “${v}”.`); return; } const df = Store.byName(f.name + " · data", "data"); if (df) Store.update(df.id, { name: v + " · data" }, "you", false); Store.update(f.id, { name: v, content: T.kitCode(f.kit, v) }, "you", "rename"); return; }
+      Store.update(f.id, { name: v }, "you", "rename");
+    };
+    const f = Store.files.get(id); if (!f) return;
+    const inp = el("input", { type: "text", class: "rename", value: f.name, "aria-label": "File name" }); nm.replaceWith(inp); inp.focus(); inp.select();
+    let done = false; const finish = commit => { if (done) return; done = true; inp.replaceWith(nm); const v = inp.value.trim(); if (commit && v && v !== f.name) renameFile(f, v); };
+    inp.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") finish(true); if (e.key === "Escape") finish(false); });
+    inp.addEventListener("blur", () => finish(true));
+  }
+}
+Object.assign(T, { personName, face, faces, initials, deckPresent, slideParts, docEditor, sheetEditor, richText, ICONS, APP_ICON, svgIcon, appTile, ibtn, iconKind, KIT_VIEWS, KIT_EDIT, devMode, kitTextEditor, mdRender, sheetEval, colName, Desktop, Editor, highlight, editorFor, noteCard, DEFAULT_SIZE, TYPE_LABEL, KIND_LABEL, WHO, Runner, checkProgram, PROGRAM_API });
+})();
+;
+/* the examples in the menu (in the single file they are <script class="preset"> blocks) */
+window.TANKE_EXAMPLES = [
+ {
+  "id": "board",
+  "title": "Board",
+  "type": "app",
+  "code": "// Board · notes sorted by kind. Captures land in Inbox; drag them where they belong.\n\napp(\"Board\")\n  .add(\n    row(\n      value(\"Open questions\", live(c => c.count({ kind: \"question\" }))),\n      value(\"Decisions\", live(c => c.count({ kind: \"decision\" }))),\n      value(\"Tasks left\", live(c => c.count({ kind: \"task\", done: false }))),\n    ),\n    grid(3,\n      zone(\"Inbox\", stream({ unsorted: true })),\n      zone(\"Questions\", stream({ kind: \"question\" })),\n      zone(\"Ideas\", stream({ kind: \"idea\" })),\n      zone(\"Decisions\", stream({ kind: \"decision\" })),\n      zone(\"Tasks\", stream({ kind: \"task\" })),\n      zone(\"Sources\", stream({ kind: \"source\" })),\n    ).gap(24),\n  )\n"
+ },
+ {
+  "id": "groceries",
+  "title": "Checklist",
+  "type": "app",
+  "code": "// Checklist · a list file, an editor and two actions that change it.\n\nconst items = file(\"Checklist\", { type: \"list\", seed: [{ text: \"First thing\", done: false }] })\n\napp(\"Checklist\")\n  .add(\n    heading(live(c => `${c.file(\"Checklist\").filter(x => !x.done).length} left`)),\n    checklist(items),\n    row(\n      button(\"Clear done\", act(c => c.write(\"Checklist\", xs => xs.filter(x => !x.done)))),\n      button(\"Uncheck all\", act(c => c.write(\"Checklist\", xs => xs.map(x => ({ ...x, done: false }))))),\n    ),\n  )\n"
+ },
+ {
+  "id": "notebook",
+  "title": "Notebook",
+  "type": "app",
+  "code": "// Notebook · one doc, written together, with a live word count.\n\nconst page = file(\"Notebook\", { type: \"doc\", seed: \"\" })\n\napp(\"Notebook\")\n  .add(\n    value(\"Words\", live(c => (c.file(\"Notebook\").match(/\\S+/g) || []).length)),\n    textedit(page, { placeholder: \"Write here. Claude can write here too.\" }),\n  )\n"
+ },
+ {
+  "id": "folder",
+  "title": "Folder",
+  "type": "app",
+  "code": "// Folder · every doc, list and table on this desktop as tiles. Click one to open it.\n\napp(\"Folder\")\n  .add(\n    heading(live(c => `${c.files.filter(f => f.type !== \"note\" && f.type !== \"app\").length} files`)),\n    files({ type: [\"doc\", \"list\", \"table\", \"data\", \"link\"] }),\n  )\n"
+ },
+ {
+  "id": "reading",
+  "title": "Reading log",
+  "type": "app",
+  "code": "// Reading log · a table file you add to from an input, with a live total.\n\nconst log = file(\"Reading log\", { type: \"table\", seed: { cols: [\"Title\", \"Pages\"], rows: [] } })\n\napp(\"Reading log\")\n  .add(\n    input(\"Add a title and press Enter\", act((text, c) =>\n      c.write(\"Reading log\", t => ({ ...t, rows: t.rows.concat([[text, 0]]) })))),\n    sheet(log),\n    value(\"Pages so far\", live(c => c.file(\"Reading log\").rows.reduce((a, r) => a + (Number(r[1]) || 0), 0))),\n  )\n"
+ },
+ {
+  "id": "decide",
+  "title": "Decision board",
+  "type": "app",
+  "code": "// Decision board · questions → options → decision → next steps, linked.\n// Tag notes #option to make them options; drag the winner into Decision.\n\nconst Step = (title, filter, hint) => zone(title, stream(filter), note(hint).tone(\"muted\").dim(true))\n\napp(\"Decide\")\n  .add(\n    heading(live(c => {\n      const d = c.count({ kind: \"decision\" })\n      return d ? `${d} decided, ${c.count({ kind: \"question\" })} still open` : \"Nothing decided yet\"\n    })),\n    row(\n      Step(\"Questions\", { kind: \"question\" }, \"What do we need to know?\").key(\"q\"),\n      Step(\"Options\", { tag: \"option\" }, \"Tag a note #option\").key(\"o\"),\n      Step(\"Decision\", { kind: \"decision\" }, \"Drag the winning option here\").key(\"d\"),\n      Step(\"Next steps\", { kind: \"task\" }, \"What happens because of it?\").key(\"n\"),\n    ).gap(56),\n    link(\"#q\", \"#o\", \"opens\"),\n    link(\"#o\", \"#d\", \"narrows to\"),\n    link(\"#d\", \"#n\", \"leads to\"),\n  )\n"
+ },
+ {
+  "id": "week",
+  "title": "Week",
+  "type": "app",
+  "code": "// Week · repeat() makes five zones while building; drag a note into Tue to tag it #tue.\n\nconst days = [\"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\"]\n\napp(\"Week\")\n  .add(\n    heading(live(c => `${c.count({ kind: \"task\", done: false })} tasks open this week`)),\n    row(repeat(days, d => zone(d, stream({ tag: d.toLowerCase() })).w(200))),\n  )\n"
+ },
+ {
+  "id": "pulse",
+  "title": "Pulse",
+  "type": "app",
+  "code": "// Pulse · live values and an orbit that turns with time.\n\napp(\"Pulse\")\n  .add(\n    row(\n      value(\"Notes\", live(c => c.count())),\n      value(\"Open questions\", live(c => c.count({ kind: \"question\" })))\n        .tone(live(c => c.count({ kind: \"question\" }) > 3 ? \"accent\" : \"ink\")),\n      value(\"Files\", live(c => c.files.length)),\n    ),\n    orbit(question(\"What matters most?\"), \"Speed\", \"Trust\", \"Cost\", \"Focus\")\n      .turn(live(c => c.t * 0.15)),\n  )\n"
+ },
+ {
+  "id": "field",
+  "title": "Field",
+  "type": "app",
+  "code": "// Field · a force simulation. Linked notes pull together; drag a handle to link.\n\napp(\"Field\")\n  .add(\n    heading(\"Everything, loosely\"),\n    zone(\"Notes\", stream({ by: \"any\" }).layout(\"cluster\")).w(520).h(380),\n  )\n"
+ },
+ {
+  "id": "shape",
+  "title": "Shape",
+  "type": "app",
+  "code": "// Shape · sketch() paints every frame; style() lights up notes tagged #hot.\n\napp(\"Shape of our thinking\")\n  .add(\n    sketch(live((g, c) => {\n      const kinds = [\"note\", \"idea\", \"question\", \"decision\", \"task\"]\n      const n = kinds.map(k => c.count({ kind: k })), max = Math.max(1, ...n), bw = g.w / kinds.length\n      kinds.forEach((k, i) => {\n        const h = (g.h - 44) * n[i] / max\n        g.rect(i * bw + 14, g.h - 26 - h, bw - 28, Math.max(1, h), k === \"idea\" ? \"accent\" : \"ink\")\n        g.text(k + \" \" + n[i], i * bw + 14, g.h - 9, \"muted\", 10)\n      })\n    })).w(440).h(200),\n    zone(\"Newest\", stream({ last: 6 }).cols(2).style(live((t, c) => ({ tone: t.tags.includes(\"hot\") ? \"accent\" : null })))),\n  )\n"
+ },
+ {
+  "id": "life",
+  "title": "Life · program",
+  "type": "program",
+  "code": "// Life · Conway's Game of Life; writes the board to \"Life board\" every tick\nconst W = 40, H = 24, gens = (input && input.generations) || 300\nlet cells = Array.from({ length: W * H }, () => Math.random() < 0.28 ? 1 : 0)\nconst at = (x, y) => cells[((y + H) % H) * W + ((x + W) % W)]\nfor (let gen = 1; gen <= gens; gen++) {\n  cells = cells.map((alive, i) => {\n    const x = i % W, y = Math.floor(i / W)\n    let n = 0\n    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) if (dx || dy) n += at(x + dx, y + dy)\n    return n === 3 || (alive && n === 2) ? 1 : 0\n  })\n  await write(\"Life board\", { w: W, h: H, gen, alive: cells.reduce((a, b) => a + b, 0), cells })\n  await sleep(160)\n}\nreturn \"Settled after \" + gens + \" generations\"\n"
+ },
+ {
+  "id": "life-app",
+  "title": "Life · app",
+  "type": "app",
+  "code": "// Life · draws the board the Life program writes. Run it from here.\nconst board = file(\"Life board\", { type: \"data\", seed: { w: 1, h: 1, gen: 0, alive: 0, cells: [0] } })\n\napp(\"Life\")\n  .add(\n    row(\n      value(\"Generation\", live(c => c.file(\"Life board\").gen)),\n      value(\"Alive\", live(c => c.file(\"Life board\").alive)).tone(\"accent\"),\n    ),\n    sketch(live((g, c) => {\n      const b = c.file(\"Life board\"), s = Math.min(g.w / b.w, g.h / b.h)\n      b.cells.forEach((v, i) => v && g.rect((i % b.w) * s, Math.floor(i / b.w) * s, s - 1, s - 1, \"ink\"))\n    })).w(480).h(288),\n    terminal(\"Life\"),\n  )\n"
+ },
+ {
+  "id": "dice",
+  "title": "Roll dice · program",
+  "type": "program",
+  "code": "// Roll dice · adds rolls to the list \"Rolls\"; input: { times }\nconst times = (input && input.times) || 5\nfor (let i = 0; i < times; i++) {\n  const n = 1 + Math.floor(Math.random() * 6)\n  await append(\"Rolls\", { text: `Rolled a ${n}`, done: n === 6 })\n  print(n)\n  await sleep(120)\n}\nreturn `${times} rolls`\n"
+ }
+];
+;
+/* ==========================================================================
+   TANKE APP · the little chrome there is: a menu corner, a view corner, a
+   selection bar, the prompt bar with the canvas agent, a drawer for Files,
+   Log and Book, settings and the window API.
+   ========================================================================== */
+(function () {
+"use strict";
+const T = window.Tanke, Store = T.Store;
+const $ = id => document.getElementById(id);
+const el = (tag, attrs, ...kids) => { const e = document.createElement(tag); if (attrs) for (const [k, v] of Object.entries(attrs)) { if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else if (v != null && v !== false) e.setAttribute(k, v === true ? "" : v); } for (const k of kids.flat()) if (k != null && k !== false) e.append(k.nodeType ? k : document.createTextNode(String(k))); return e; };
+const { svgIcon, appTile, ibtn, iconKind, personName, face, faces, initials } = T;
+let focusId = null; // the app filling the screen, if any (see FOCUS)
+const NO_EDIT = ["canvas", "records", "slides"]; // built-in apps that are always editable, like a document
+const local = { get(k, d) { try { const v = localStorage.getItem("tanke.v2." + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem("tanke.v2." + k, JSON.stringify(v)); } catch (e) {} } };
+// the textbook and the examples live inline in the single file, or beside the page as book.md and in computer.js
+let DOCS = $("docs") ? $("docs").textContent.replace(/^\n/, "") : "";
+const EXAMPLES = (window.TANKE_EXAMPLES || [...document.querySelectorAll("script.preset")].map(s => ({ id: s.dataset.id, title: s.dataset.title, type: s.dataset.type || "app", code: s.textContent.replace(/^\n/, "").replace(/\s+$/, "") + "\n" })));
+const listeners = {};
+const emit = (ev, data) => (listeners[ev] || []).forEach(f => { try { f(data); } catch (e) { console.error(e); } });
+const WHO = T.WHO, TYPE_LABEL = T.TYPE_LABEL;
+
+/* ---------- toast ---------- */
+let toastT = null;
+function toast(msg, action) {
+  const t = $("toast"); t.replaceChildren(document.createTextNode(msg));
+  if (action) t.append(el("button", { type: "button", onclick: () => { t.hidden = true; action.fn(); } }, action.label));
+  t.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => (t.hidden = true), action ? 7000 : 3600);
+}
+/* ---------- theme tokens ---------- */
+let TOK = {};
+function readTokens() { const cs = getComputedStyle(document.documentElement), v = n => cs.getPropertyValue(n).trim(); TOK = { canvas: v("--canvas"), surface: v("--surface"), ink: v("--ink"), ink2: v("--ink-2"), muted: v("--muted"), line: v("--line"), line2: v("--line-2"), accent: v("--accent"), positive: v("--positive"), danger: v("--danger") }; }
+function applyTheme(t) { if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t; local.set("theme", t); readTokens(); }
+function toggleTheme() { const cur = document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); applyTheme(cur === "dark" ? "light" : "dark"); }
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", readTokens);
+
+/* ---------- app parameters: per viewer, per app ---------- */
+const paramsFor = id => local.get("params." + id, {});
+function setParam(id, name, value) { const p = paramsFor(id); p[name] = value; local.set("params." + id, p); desk.sync(); emit("param", { app: id, name, value }); }
+
+/* ==========================================================================
+   DESKTOP
+   ========================================================================== */
+let camT = null;
+const desk = new T.Desktop({
+  stage: $("stage"), world: $("world"), tokens: () => TOK, paramsFor, setParam, toast,
+  active: () => true,
+  onCamera: cam => { $("zoom-val").textContent = Math.round(cam.z * 100) + "%"; clearTimeout(camT); camT = setTimeout(() => { local.set("cam." + Store.deskId, cam); sharePresence(); }, 400); },
+  onSelect: () => { placeSelbar(true); sharePresence(); refreshSendState(); },
+  onFrame: () => placeSelbar(false),
+  removeFile: id => removeFile(id),
+  contextMenu: (x, y, w) => openMenu(newItems(w), x, y),
+  windowMenu: (id, x, y) => openMenu(windowItems(id), x, y),
+  toggleFocus: id => setFocus(focusId === id ? null : id),
+  onAppErrors: () => {},
+  // programs can ask Claude a question: same model chain as the bar, no desktop context
+  askClaude: async (q, signal) => (await complete("You are called from a program on a shared desktop. Answer the question directly and briefly. No preamble.", q, () => {}, signal, () => {}, { cache: true })).text,
+  // c.claude() in an app: the person's click hands the turn to Claude in the chat
+  toClaude: (say, data, app) => toClaudeFromApp(say, data, app),
+  // c.make() in an app and make() in a program: the Claude built into the page builds on the desktop
+  make: request => ask(request),
+  // people: c.me and c.people in apps, me and people in programs
+  me: () => meNow(), peopleHere: () => peopleNow(),
+  // a window I drag moves on everyone's screen while I drag it; panning myself stops following someone
+  onDragMove: r => sharePatch({ drag: r ? Object.assign({}, r, { desk: Store.deskId }) : null }),
+  onUserCamera: () => { if (following) stopFollowing(); },
+});
+readTokens();
+function frame(now) { requestAnimationFrame(frame); desk.frame(now); }
+requestAnimationFrame(frame);
+$("zoom-in").addEventListener("click", () => { const r = $("stage").getBoundingClientRect(); desk.zoomAt(r.width / 2, r.height / 2, 1.2); });
+$("zoom-out").addEventListener("click", () => { const r = $("stage").getBoundingClientRect(); desk.zoomAt(r.width / 2, r.height / 2, 1 / 1.2); });
+$("fit").addEventListener("click", () => desk.fit());
+window.addEventListener("resize", () => desk.applyCam());
+
+/* ---------- creating files ---------- */
+const BLANK_APP = name => `// ${name} · a Tanke app. It renders here; files it uses live on this desktop.\nconst notes = file("${name} notes", { type: "doc" })\n\napp("${name}")\n  .add(\n    heading("${name}"),\n    textedit(notes),\n  )\n`;
+const BLANK_PROGRAM = `// A program: real JavaScript that runs when you press Run (⌘/Ctrl + Enter).
+// It can print, read and write files on this desktop, wait, and ask Claude.
+const notes = await files({ type: "note" })
+print(\`This desktop has \${notes.length} notes.\`)
+for (let i = 3; i > 0; i--) { print(i); await sleep(400) }
+return "Done"
+`;
+function newFile(type, at, extra) {
+  if (type === "note") { const p = at || desk.viewCenter(); desk.newNoteAt(p.x - 110, p.y - 30); return null; }
+  const d = T.DEFAULT_SIZE[type] || [300, 220], pos = at ? { x: Math.round(at.x), y: Math.round(at.y) } : desk.freeSpot(d[0], d[1]);
+  const f = Store.add(Object.assign({ type, placed: true, x: pos.x, y: pos.y }, type === "app" ? { name: "Untitled app", content: BLANK_APP("Untitled app") } : {}, extra || {}), "you");
+  setTimeout(() => { const o = desk.objs.get(f.id); if (!o) return; desk.select(f.id); if (type === "app" && !(extra && extra.content)) desk.setMode(o, f.id, "code"); }, 40);
+  return f;
+}
+function appFromCode(code, name, by, at) {
+  const title = name || (code.match(/(?:app|space)\(\s*["'`]([^"'`]+)["'`]/) || [])[1] || "Untitled app";
+  const pos = at || desk.freeSpot(560, 440);
+  const f = Store.add({ type: "app", name: title, content: code, placed: true, x: pos.x, y: pos.y }, by || "you");
+  setTimeout(() => desk.reveal(f.id), 60);
+  return f;
+}
+/* a program's name is its first comment line: "// Name · what it does" */
+function programFromCode(code, name, by, at) {
+  const title = name || (String(code).match(/^\s*\/\/\s*([^·\n]+?)\s*(?:·|\n)/) || [])[1] || "Untitled program";
+  const existing = Store.byName(title, "program");
+  if (existing) { Store.update(existing.id, { content: code, placed: true }, by || "you", "program"); setTimeout(() => desk.reveal(existing.id), 60); return existing; }
+  const pos = at || desk.freeSpot(520, 420);
+  const f = Store.add({ type: "program", name: title, content: code, placed: true, x: Math.round(pos.x), y: Math.round(pos.y) }, by || "you");
+  setTimeout(() => desk.reveal(f.id), 60);
+  return f;
+}
+function removeFile(id) {
+  const g = Store.files.get(id), df = g && g.type === "app" && g.kit ? Store.byName(g.name + " · data", "data") : null;
+  const f = Store.remove(id, "you"); if (!f) return; desk.select(null);
+  const d = df ? Store.remove(df.id, "you") : null;
+  toast(`Deleted “${String(f.name).slice(0, 40)}”.`, { label: "Undo", fn: () => { if (d) Store.restore(d); Store.restore(f); } });
+}
+
+/* ---------- a window's menu: what you can do with this file, like a desktop app's ---------- */
+function freeName(base, type) { let n = base, i = 2; while (Store.byName(n, type)) n = base + " " + i++; return n; }
+function duplicateFile(id) {
+  const f = Store.files.get(id); if (!f) return;
+  const o = desk.objs.get(id), at = { x: Math.round((f.x || 0) + 32), y: Math.round((f.y || 0) + 32) };
+  if (f.type === "app" && f.kit && T.KITS[f.kit]) {
+    const name = freeName(f.name + " copy", "app"), df = Store.byName(f.name + " · data", "data");
+    Store.add({ type: "data", name: name + " · data", content: JSON.parse(JSON.stringify(df ? df.content : {})), placed: false, kit: f.kit }, "you");
+    const n = Store.add({ type: "app", name, content: T.kitCode(f.kit, name), kit: f.kit, placed: true, x: at.x, y: at.y, w: f.w, h: f.h }, "you", "create");
+    setTimeout(() => desk.reveal(n.id), 60); return;
+  }
+  const n = Store.add({ type: f.type, name: freeName(f.name + " copy", f.type), content: JSON.parse(JSON.stringify(f.content ?? null)), placed: true, x: at.x, y: at.y, w: f.w, h: f.h, tags: f.tags || [] }, "you");
+  setTimeout(() => desk.reveal(n.id), 60);
+}
+const csvCell = v => { const t = String(v ?? ""); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+const toCsv = (cols, rows) => [cols].concat(rows).map(r => r.map(csvCell).join(",")).join("\n");
+async function saveFile(filename, data, label) {
+  if (downloads) { try { await downloads.save({ filename, data }); return; } catch (e) { if (e && e.code === "declined") return; } }
+  try { const a = el("a", { href: URL.createObjectURL(new Blob([data], { type: "text/plain" })), download: filename }); document.body.append(a); a.click(); a.remove(); return; } catch (e) {}
+  try { await navigator.clipboard.writeText(data); toast(`${label || "It"} is copied.`); } catch (e) { toast("Saving isn't available in this view."); }
+}
+/* a standalone page for a website or a deck, in the desktop's own look */
+function htmlPage(title, bodyHtml) {
+  const cs = getComputedStyle(document.documentElement), vars = ["surface", "panel-2", "ink", "ink-2", "muted", "line", "line-2", "accent", "accent-ink"].map(k => `--${k}:${cs.getPropertyValue("--" + k).trim()};`).join("");
+  const css = [...document.styleSheets].flatMap(sh => { try { return [...sh.cssRules].map(r => r.cssText).filter(t => /^\.(md|ksite|ks-|k-site|ks-stage)/.test(t)); } catch (e) { return []; } }).join("\n");
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${mdEsc(title)}</title><style>:root{${vars}--r:2.5px;--font:Arial,Helvetica,sans-serif}body{margin:0;font:15px/1.5 var(--font);color:var(--ink);background:var(--surface)}${css}.deck .ks-stage{margin:24px auto;max-width:960px;aspect-ratio:16/10}</style></head><body>${bodyHtml}</body></html>`;
+}
+function exportItems(f) {
+  const base = T.slug(f.name || "file") || "file";
+  if (f.type === "table") return [item("Export CSV", () => { const t = f.content || {}; saveFile(base + ".csv", toCsv(t.cols || [], t.rows || []), "The sheet"); })];
+  if (f.type === "doc") return [item("Export Markdown", () => saveFile(base + ".md", String(f.content || ""), "The document"))];
+  if (f.type === "list") return [item("Export text", () => saveFile(base + ".txt", T.encodeBody("list", f.content), "The list"))];
+  if (f.type === "page") return [item("Export HTML", () => saveFile(base + ".html", String(f.content || ""), "The page"))];
+  if (f.type === "data") return [item("Export JSON", () => saveFile(base + ".json", JSON.stringify(f.content, null, 2), "The data"))];
+  if (f.type === "note") return [item("Export text", () => saveFile((T.slug(String(f.content).slice(0, 40)) || "note") + ".txt", String(f.content || ""), "The note"))];
+  if (f.type === "link") return [item("Copy the address", async () => { try { await navigator.clipboard.writeText((f.content || {}).url || ""); toast("Copied."); } catch (e) {} })];
+  if (f.type === "program") return [item("Export JavaScript", () => saveFile(base + ".js", String(f.content || ""), "The program"))];
+  if (!(f.type === "app" && f.kit && T.KITS[f.kit])) return [];
+  const df = Store.byName(f.name + " · data", "data"), d = (df && df.content) || {}, K = T.KITS[f.kit], out = [];
+  if (f.kit === "records") out.push(item("Export CSV", () => saveFile(base + ".csv", toCsv(d.fields || [], (d.records || []).map(r => (d.fields || []).map(k => r[k] ?? ""))), "The records")));
+  if (f.kit === "chart") out.push(item("Export CSV", () => saveFile(base + ".csv", toCsv(d.cols || [], d.rows || []), "The data")));
+  if (f.kit === "form") out.push(item("Export answers (CSV)", () => {
+    const ms = df ? Store.marksFor(Store.markScope("f", df.id)).filter(m => m.v && typeof m.v === "object") : [];
+    const rows = ms.length ? ms.map(m => [(Store.person(m.id) || {}).name || personName(m.id)].concat((d.fields || []).map(x => m.v[x.key] ?? ""))) : [[""].concat((d.fields || []).map(x => (d.values || {})[x.key] ?? ""))];
+    saveFile(base + ".csv", toCsv(["Person"].concat((d.fields || []).map(x => x.label)), rows), "The answers");
+  }));
+  if (f.kit === "site") out.push(item("Export HTML", () => { const v = T.KIT_VIEWS.site(d, { preview: true }); saveFile(base + ".html", htmlPage(f.name, v.innerHTML), "The website"); }));
+  if (f.kit === "slides") out.push(item("Export HTML", () => saveFile(base + ".html", htmlPage(f.name, `<div class="deck">${(d.slides || []).map(x => `<div class="ks-stage">${mdRender(T.slideParts(x).body).outerHTML}</div>`).join("")}</div>`), "The deck")));
+  if (f.kit === "canvas") out.push(item("Export SVG", () => saveFile(base + ".svg", canvasSvg(d), "The canvas")));
+  out.push(item("Copy as text", async () => { try { await navigator.clipboard.writeText(`@@${f.kit} ${f.name}${T.kitVariant(f.kit, d) ? " · " + T.kitVariant(f.kit, d) : ""}\n${K.encode(d)}\n@@end`); toast("Copied, in the text Claude reads."); } catch (e) { toast("Copying isn't available in this view."); } }));
+  return out;
+}
+/* the canvas as a picture: boxes, pills, circles, decisions, notes and arrows */
+function canvasSvg(d) {
+  const nodes = d.nodes || [], size = n => n.shape === "note" || n.shape === "diamond" ? [150, 96] : n.shape === "circle" ? [104, 104] : [160, Math.max(48, 24 + Math.ceil(String(n.label).length / 20) * 18)];
+  const W = Math.max(200, ...nodes.map(n => (n.x || 0) + size(n)[0])) + 24, H = Math.max(120, ...nodes.map(n => (n.y || 0) + size(n)[1])) + 24, cs = getComputedStyle(document.documentElement), ink = cs.getPropertyValue("--ink").trim(), line = cs.getPropertyValue("--line-2").trim(), surf = cs.getPropertyValue("--surface").trim();
+  const STK = { yellow: "#EBDBBC", pink: "#F2D3C7", blue: "#D3E1EF", green: "#DCE3D1", grey: "#E8E6DC", purple: "#DDD8E6", orange: "#F0C9B8" };
+  let out = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" font-family="Arial, Helvetica, sans-serif"><rect width="100%" height="100%" fill="${surf}"/><defs><marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="${ink}"/></marker></defs>`;
+  const box = n => { const [w, h] = size(n); return { x: n.x || 0, y: n.y || 0, w, h }; };
+  for (const e of d.edges || []) { const a = nodes.find(n => n.id === e.from), b = nodes.find(n => n.id === e.to); if (!a || !b) continue; const A = box(a), B = box(b), ax = A.x + A.w / 2, ay = A.y + A.h / 2, bx = B.x + B.w / 2, by = B.y + B.h / 2; out += `<line x1="${ax}" y1="${ay}" x2="${bx}" y2="${by}" stroke="${ink}" stroke-width="1.25"${e.dashed ? ' stroke-dasharray="4 3"' : ""} marker-end="url(#a)"/>`; if (e.label) out += `<text x="${(ax + bx) / 2}" y="${(ay + by) / 2 - 4}" text-anchor="middle" font-size="11" font-weight="700" fill="${ink}">${mdEsc(e.label)}</text>`; }
+  for (const n of nodes) { const b = box(n), fill = STK[n.color] || surf, cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    out += n.shape === "circle" ? `<circle cx="${cx}" cy="${cy}" r="${b.w / 2}" fill="${fill}" stroke="${line}"/>` : n.shape === "diamond" ? `<path d="M${cx},${b.y} L${b.x + b.w},${cy} L${cx},${b.y + b.h} L${b.x},${cy} Z" fill="${fill}" stroke="${line}"/>` : `<rect x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="${n.shape === "round" ? b.h / 2 : 2.5}" fill="${fill}" stroke="${n.shape === "note" ? "none" : line}"/>`;
+    out += `<text x="${cx}" y="${cy + 4}" text-anchor="middle" font-size="12.5" fill="${ink}">${mdEsc(n.label)}</text>`; }
+  return out + "</svg>";
+}
+function windowItems(id) {
+  const f = Store.files.get(id); if (!f) return [];
+  const o = desk.objs.get(id), kit = f.type === "app" && f.kit && T.KITS[f.kit] ? f.kit : null, K = kit ? T.KITS[kit] : null, ed = desk.editing.get(id);
+  const nm = () => { const e = desk.elFor(id), n = e && e.querySelector(".obj-head .nm"); if (n) desk.rename(id, n); };
+  const items = [item(focusId === id ? "Leave focus" : "Focus", () => setFocus(focusId === id ? null : id), "F")];
+  if (kit) {
+    if (!NO_EDIT.includes(kit)) items.push(item(ed === "edit" ? "Done editing" : "Edit", () => desk.setEditing(id, ed === "edit" ? null : "edit")));
+    items.push(item(ed === "text" ? "Back to the app" : "Edit as text", () => desk.setEditing(id, ed === "text" ? null : "text"), "what Claude writes"));
+  } else if (f.type === "app") items.push(item("Change it with Claude…", () => { prompt.value = `Change the app “${f.name}”: `; grow(); prompt.focus(); }));
+  items.push(el("hr"), item("Rename", nm), item("Duplicate", () => duplicateFile(id)));
+  if (kit) items.push(item(`New ${K.title.toLowerCase()}`, () => newKit(kit)));
+  else if (["doc", "table", "list", "page", "link"].includes(f.type)) items.push(item(`New ${({ doc: "document", table: "spreadsheet", list: "checklist", page: "page", link: "link" })[f.type]}`, () => newFile(f.type, null, f.type === "table" ? { content: { cols: ["Item", "Amount"], rows: [["", ""]] } } : undefined)));
+  const ex = exportItems(f); if (ex.length) items.push(el("hr"), el("h4", null, "Export"), ...ex);
+  items.push(el("hr"));
+  if (f.type !== "note") items.push(item("Tuck away", () => { Store.update(id, { placed: false }, "you", "tuck"); toast(`“${f.name}” is in Files.`, { label: "Open Files", fn: () => openDrawer("files") }); }, "keep, hide"));
+  items.push(item("Send to Claude", () => { const g = Store.files.get(id); if (g) handToClaude(payloadForFile(g), "The file"); }));
+  if (T.devMode() && f.type === "app" && o) items.push(item(o.mode === "code" ? "Show the app" : "Show the program", () => desk.setMode(o, id, o.mode === "app" ? "code" : "app"), "developer"));
+  items.push(item("Delete", () => removeFile(id), "⌫"));
+  return items;
+}
+
+
+/* ---------- the cube: Claude in the corner, a little cube whose face follows the pointer ----------
+   It turns in 3D to look where you point, blinks, and glances around when nothing happens.
+   While Claude works it moves: on the desktop it flies to what Claude is writing and rides
+   along with Claude's marker; working elsewhere (a turn from the chat) it turns over in place. */
+(function cube() {
+  const btn = $("menu-btn"), wrap = btn.querySelector(".cube-wrap"), cubeEl = btn.querySelector(".cube"), eyes = [...btn.querySelectorAll(".orb-eye")], shadow = btn.querySelector(".cube-shadow");
+  const st = { yaw: 0, pitch: 0, ty: 0, tp: 0, blink: 0, nextBlink: performance.now() + 2500, moved: 0, px: 0, py: 0, vx: 0, vy: 0, spin: 0, mx: innerWidth / 2, my: innerHeight / 2 };
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const look = (x, y) => { st.mx = x; st.my = y; st.moved = performance.now(); };
+  document.addEventListener("pointermove", e => look(e.clientX, e.clientY), { passive: true });
+  document.addEventListener("pointerdown", e => look(e.clientX, e.clientY), { passive: true });
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const busy = document.body.classList.contains("claude-busy");
+    // where Claude is on the desktop, if its marker is showing on screen
+    const cc = document.querySelector("#world .claude-cursor.on"), home = btn.getBoundingClientRect(), hx = home.left + home.width / 2, hy = home.top + home.height / 2;
+    let tx = 0, ty = 0, away = false;
+    if (cc && !document.body.classList.contains("focus-mode")) { const r = cc.getBoundingClientRect(); if (r.width && r.right > 0 && r.left < innerWidth && r.bottom > 0 && r.top < innerHeight) { tx = r.left - 4 - hx; ty = r.top + r.height / 2 - hy; away = true; } }
+    document.body.classList.toggle("cube-away", away && Math.hypot(st.px - tx, st.py - ty) < 40);
+    // a soft spring carries it there and back
+    const k = reduce ? 1 : 0.075, damp = reduce ? 0 : 0.76;
+    st.vx = (st.vx + (tx - st.px) * k) * damp; st.vy = (st.vy + (ty - st.py) * k) * damp; st.px += st.vx; st.py += st.vy;
+    if (reduce) { st.px = tx; st.py = ty; }
+    const flying = Math.hypot(st.vx, st.vy) > 0.6, bob = busy && away && !reduce ? Math.sin(now / 210) * 2.2 : 0;
+    wrap.style.transform = `translate(${st.px.toFixed(1)}px, ${(st.py + bob).toFixed(1)}px)`;
+    shadow.style.opacity = away || flying ? "0" : "1";
+    // where it looks: at the pointer, or at the work while writing
+    const cx = hx + st.px, cy = hy + st.py;
+    if (busy && away) { st.ty = 26 + Math.sin(now / 520) * 10; st.tp = -14 + Math.sin(now / 340) * 6; }
+    else if (now - st.moved > 4500) { if (Math.random() < 0.006) { st.ty = (Math.random() - 0.5) * 60; st.tp = (Math.random() - 0.4) * 34; } }
+    else { st.ty = Math.tanh((st.mx - cx) / 360) * 40; st.tp = -Math.tanh((st.my - cy) / 360) * 30; }
+    const kk = reduce ? 1 : 0.13; st.yaw += (st.ty - st.yaw) * kk; st.pitch += (st.tp - st.pitch) * kk;
+    // working without a place on screen: it turns over in place
+    if (busy && !away && !reduce) st.spin = (st.spin + 3.2) % 360; else if (st.spin) { const to = st.spin > 180 ? 360 : 0; st.spin += (to - st.spin) * 0.12; if (Math.abs(to - st.spin) < 0.5) st.spin = 0; }
+    const tilt = Math.max(-25, Math.min(25, st.vx * 1.6)), roll = Math.max(-25, Math.min(25, -st.vy * 1.6));
+    cubeEl.style.transform = `rotateX(${(st.pitch + roll).toFixed(2)}deg) rotateY(${(st.yaw + tilt + st.spin).toFixed(2)}deg)`;
+    if (!reduce && now > st.nextBlink) { st.blink = 1; st.nextBlink = now + 2200 + Math.random() * 4200; if (Math.random() < 0.2) st.nextBlink = now + 260; }
+    st.blink = Math.max(0, st.blink - 0.11);
+    const b = st.blink > 0 ? 1 - Math.sin(st.blink * Math.PI) * 0.92 : 1, ex = Math.max(-1.6, Math.min(1.6, st.yaw / 22)), ey = Math.max(-1.4, Math.min(1.4, -st.pitch / 22));
+    eyes.forEach(e => { e.style.transform = `translate(${ex.toFixed(2)}px, ${ey.toFixed(2)}px) scaleY(${b.toFixed(3)})`; });
+  }
+  requestAnimationFrame(frame);
+})();
+/* ---------- the menu ---------- */
+let menuOpen = false;
+function openMenu(items, x, y) {
+  const m = $("menu"); m.replaceChildren(...items); m.hidden = false; menuOpen = true;
+  const r = m.getBoundingClientRect(), W = innerWidth, H = innerHeight;
+  m.style.left = Math.max(8, Math.min(W - r.width - 8, x)) + "px"; m.style.top = Math.max(8, Math.min(H - r.height - 8, y)) + "px";
+  $("menu-btn").setAttribute("aria-expanded", "true");
+  const first = m.querySelector("button"); if (first) first.focus({ preventScroll: true });
+}
+function closeMenu() { $("menu").hidden = true; menuOpen = false; $("menu-btn").setAttribute("aria-expanded", "false"); }
+document.addEventListener("pointerdown", e => { if (menuOpen && !e.target.closest("#menu, #menu-btn")) closeMenu(); }, true);
+document.addEventListener("keydown", e => {
+  if (!menuOpen) return;
+  if (e.key === "Escape") { closeMenu(); $("menu-btn").focus(); return; }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") { const bs = [...$("menu").querySelectorAll("button")], i = bs.indexOf(document.activeElement); if (bs.length) { e.preventDefault(); bs[(i + (e.key === "ArrowDown" ? 1 : -1) + bs.length) % bs.length].focus(); } }
+});
+const item = (label, fn, hint, current) => el("button", { type: "button", role: "menuitem", "aria-current": current ? "true" : null, onclick: () => { closeMenu(); fn(); } }, label, hint ? el("small", null, hint) : null);
+function newItems(at) {
+  const kit = (k, label, hint) => item(label, () => newKit(k, at), hint);
+  return [el("h4", null, "New"),
+    item("Note", () => newFile("note", at), "double-click"), item("Document", () => newFile("doc", at), "markdown"), item("Spreadsheet", () => newFile("table", at, { content: { cols: ["Item", "Amount"], rows: [["One", 10], ["Two", 20], ["Total", "=SUM(B1:B2)"]] } }), "formulas"),
+    kit("slides", "Presentation", "slides"), kit("canvas", "Canvas", "boxes and arrows"), kit("site", "Website", "from text"), T.devMode() ? item("Page", () => newFile("page", at), "HTML") : null, kit("records", "Records", "a small database"),
+    item("App…", () => { prompt.value = "Make an app that "; grow(); prompt.focus(); }, "describe it"),
+    T.devMode() ? item("App from code", () => newFile("app", at), "Tanke") : null, T.devMode() ? item("Program", () => newFile("program", at, { content: BLANK_PROGRAM }), "JavaScript") : null,
+    el("h4", null, "Built-in apps"),
+    kit("quiz", "Quiz"), kit("poll", "Poll"), kit("form", "Form"), kit("chart", "Chart"), kit("board", "Board"), kit("timeline", "Timeline"), kit("cards", "Cards"),
+    item("Checklist", () => newFile("list", at)), item("Link", () => newFile("link", at)), T.devMode() ? item("Data", () => newFile("data", at), "JSON") : null,
+    ...(T.devMode() ? [el("h4", null, "From an example")] : []), ...(T.devMode() ? EXAMPLES : []).map(x => item(x.title, () => x.type === "program" ? programFromCode(x.code, null, "you", at) : appFromCode(x.code, x.title.replace(/ · app$/, ""), "you", at), x.type === "program" ? "program" : "app"))].filter(Boolean);
+}
+$("menu-btn").addEventListener("click", () => {
+  if (menuOpen) { closeMenu(); return; }
+  const desks = [...Store.desks.values()].sort((a, b) => (b.at || 0) - (a.at || 0));
+  const r = $("menu-btn").getBoundingClientRect();
+  openMenu([
+    el("div", { class: "menu-title" }, Store.desk().title || "CC3"),
+    el("h4", null, "Desktops"),
+    ...desks.slice(0, 12).map(d => item(d.title || d.id, () => switchDesk(d.id), null, d.id === Store.deskId)),
+    desks.some(d => d.id === Store.deskId) ? null : item(Store.desk().title, () => {}, "new", true),
+    item("New desktop…", () => { const id = Store.createDesk("New desktop", "you"); switchDesk(id); setTimeout(openSettings, 200); }),
+    el("hr"), ...newItems(null), el("hr"),
+    item("Files", () => openDrawer("files"), String(Store.files.size || "")), item("Log", () => openDrawer("log")), item("Book", () => openDrawer("book")),
+    el("hr"), item("Export desktop", exportDesk), item("Settings", openSettings), item("Switch theme", toggleTheme),
+  ].filter(Boolean), r.left, r.bottom + 6);
+});
+function switchDesk(id) { if (id === Store.deskId) return; if (activeTurnFlush) activeTurnFlush(); if (chat.abort) chat.abort.abort(); lastViewKey.mine = lastViewKey.shared = ""; viewAsOf.mine = viewAsOf.shared = writtenAsOf.mine = writtenAsOf.shared = 0; sharedWriter.until = 0; Store.turnIssue = null; Store.writeIssues = []; Store.switchDesk(id); desk.select(null); desk.clearDrafts(); chat.msgs = []; $("messages").replaceChildren(); fitted = false; sharePresence(); }
+
+/* ---------- selection bar ---------- */
+let selKey = "";
+function placeSelbar(rebuild) {
+  const bar = $("selbar"), id = desk.sel, f = id && Store.files.get(id), e = id && desk.elFor(id);
+  if (!f || !e || focusId) { if (!bar.hidden) bar.hidden = true; selKey = ""; return; }
+  const key = id + f.kind + f.placed + f.type + (desk.objs.get(id) || {}).mode + sendState + (desk.editing.get(id) || "") + f.name;
+  if (rebuild || key !== selKey) {
+    selKey = key; bar.replaceChildren();
+    const sep = () => el("span", { class: "sep" });
+    if (f.type === "note") {
+      for (const k of T.KINDS) bar.append(el("button", { type: "button", "aria-pressed": String(f.kind === k), onclick: () => Store.update(id, { kind: k }, "you", "edit") }, T.KIND_LABEL[k]));
+      bar.append(sep(), ibtn("edit", "Edit", () => { const c = desk.world.querySelector(`[data-note="${CSS.escape(String(id))}"]`); if (c) desk.editNote(c); }));
+      if (f.placed) bar.append(ibtn("tuck", "To the inbox", () => { Store.update(id, { placed: false }, "you", false); Store.log("move", `${f.content} → Inbox`, id, "you", f.kind); }));
+    } else {
+      const kit = f.type === "app" && f.kit && T.KITS[f.kit] ? f.kit : null, ed = desk.editing.get(id);
+      if (kit && !NO_EDIT.includes(kit)) { const b = ibtn("edit", ed === "edit" ? "Done editing" : "Edit", () => desk.setEditing(id, ed === "edit" ? null : "edit")); b.setAttribute("aria-pressed", String(ed === "edit")); bar.append(b); }
+      bar.append(ibtn("focus", "Focus · F", () => setFocus(id)));
+      bar.append(sep(), ibtn("rename", "Rename", () => { const nm = e.querySelector(".obj-head .nm"); if (nm) desk.rename(id, nm); }), ibtn("duplicate", "Duplicate", () => duplicateFile(id)));
+      const ex = exportItems(f);
+      if (ex.length) { const b = ibtn("export", ex.length === 1 ? ex[0].firstChild.textContent : "Export…", ev => { if (ex.length === 1) ex[0].click(); else { const r = b.getBoundingClientRect(); openMenu([el("h4", null, "Export"), ...exportItems(f)], r.left, r.bottom + 6); } }); bar.append(b); }
+      bar.append(ibtn("tuck", "Tuck away (keep it in Files)", () => { Store.update(id, { placed: false }, "you", "tuck"); toast(`“${f.name}” is in Files.`, { label: "Open Files", fn: () => openDrawer("files") }); }));
+      if (f.type === "app" && T.devMode()) { const o = desk.objs.get(id); bar.append(ibtn("code", o && o.mode === "code" ? "Show the app" : "Show the program", () => o && desk.setMode(o, id, o.mode === "app" ? "code" : "app"))); }
+    }
+    bar.append(ibtn("delete", "Delete", () => removeFile(id), "danger"));
+    // the hand-off: this file, into your message box in the chat beside the desktop
+    bar.append(sep(), el("button", { type: "button", class: "to-claude", title: canSend() ? "Put this file in your message to Claude" : "Copy this file to paste into the chat with Claude", onclick: () => { const g = Store.files.get(id); if (g) handToClaude(payloadForFile(g), "The file"); } }, canSend() ? "Send to Claude" : "Copy for Claude"));
+  }
+  const r = e.getBoundingClientRect(); bar.hidden = false;
+  const bw = bar.offsetWidth || 300;
+  bar.style.left = Math.max(8, Math.min(innerWidth - bw - 8, r.left)) + "px";
+  bar.style.top = Math.max(56, r.top - 44) + "px";
+}
+
+/* ==========================================================================
+   FOCUS · one app fills the screen, like an app opened full screen. The
+   window leaves the desktop's zoomed world for a layer of its own and comes
+   back where it was. F or the title bar's ⤢ enters; Esc leaves.
+   ========================================================================== */
+function setFocus(id) {
+  const prev = focusId;
+  if (prev) { const o = desk.objs.get(prev); if (o) { o.el.classList.remove("focused"); desk.world.append(o.el); const a = desk.apps.get(prev); if (a) a.sig = null; } }
+  focusId = id && id !== prev && desk.objs.get(id) && (Store.files.get(id) || {}).type !== "note" ? id : null;
+  document.body.classList.toggle("focus-mode", !!focusId);
+  if (focusId) {
+    const o = desk.objs.get(focusId), a = desk.apps.get(focusId); $("focus-layer").append(o.el); o.el.classList.add("focused"); if (a) a.sig = null;
+    desk.select(focusId); o.el.querySelectorAll(".focus-btn").forEach(b => { b.replaceChildren(svgIcon("unfocus")); b.setAttribute("data-tip", "Back to the desktop · Esc"); });
+    setTimeout(() => { const t = o.el.querySelector(".kd, .k-canvas.live, .sg-grid, .rt-body, input, textarea"); if (t && t.focus) t.focus({ preventScroll: true }); }, 60);
+  }
+  if (prev) { const o = desk.objs.get(prev); if (o) o.el.querySelectorAll(".focus-btn").forEach(b => { b.replaceChildren(svgIcon("focus")); b.setAttribute("data-tip", "Focus · F"); }); }
+  desk.sync(); placeSelbar(true);
+}
+$("focus-layer").addEventListener("contextmenu", e => { const ob = e.target.closest(".obj[data-id]"); if (!ob || e.target.closest("textarea, input, [contenteditable], .kv-board")) return; e.preventDefault(); openMenu(windowItems(ob.dataset.id), e.clientX, e.clientY); });
+$("focus-layer").addEventListener("dblclick", e => { if (e.target.closest(".obj-head") && !e.target.closest("button, .nm, input")) setFocus(null); });
+
+/* ==========================================================================
+   LAUNCHER · press / (or the search button by the orb). Make something new, open anything on this desktop, run a
+   command, or ask Claude, from one search field. Enter opens in focus;
+   Shift+Enter shows it on the desktop instead.
+   ========================================================================== */
+const LAUNCH_NEW = [
+  ["doc", "Document", () => newFile("doc", null, { name: freeName("Untitled document", "doc"), content: "# Untitled\n\n" })],
+  ["table", "Spreadsheet", () => newFile("table", null, { name: freeName("Untitled sheet", "table"), content: { cols: ["Item", "Amount", "Notes"], rows: [["", "", ""], ["", "", ""], ["Total", "=SUM(B1:B2)", ""]] } })],
+  ["slides", "Presentation", () => newKit("slides")], ["canvas", "Canvas", () => newKit("canvas")], ["site", "Website", () => newKit("site")],
+  ["board", "Board", () => newKit("board")], ["records", "Records", () => newKit("records")], ["form", "Form", () => newKit("form")],
+  ["poll", "Poll", () => newKit("poll")], ["quiz", "Quiz", () => newKit("quiz")], ["chart", "Chart", () => newKit("chart")], ["timeline", "Timeline", () => newKit("timeline")],
+  ["cards", "Cards", () => newKit("cards")], ["list", "Checklist", () => newFile("list")], ["note", "Note", () => newFile("note")], ["app", "App…", null],
+];
+let launchSel = 0, launchRows = [];
+function openLauncher(q) {
+  closeMenu(); $("launcher").hidden = false; const inp = $("ln-q"); inp.value = q || ""; launchSel = 0; renderLauncher(); setTimeout(() => inp.focus(), 0);
+}
+function closeLauncher() { $("launcher").hidden = true; }
+function launchNew(kind, label, fn) {
+  closeLauncher();
+  if (kind === "app") { prompt.value = "Make an app that "; grow(); prompt.focus(); return null; }
+  const before = new Set(Store.files.keys()); fn();
+  setTimeout(() => { const made = [...Store.files.keys()].find(k => !before.has(k) && (Store.files.get(k) || {}).type !== "data"); if (made && kind !== "note") setFocus(made); }, 120);
+}
+function renderLauncher() {
+  const q = $("ln-q").value.trim().toLowerCase(), body = $("ln-body"); launchRows = [];
+  const row = (tile, title, sub, run, cls) => { const i = launchRows.length, r = el("button", { type: "button", class: "ln-row" + (cls ? " " + cls : ""), role: "option", "data-i": String(i), onclick: ev => run(ev.shiftKey), onmousemove: () => { if (launchSel !== i) { launchSel = i; markLauncher(); } } }, tile, el("span", { class: "ln-t" }, title), sub ? el("small", null, sub) : null); launchRows.push({ el: r, run }); return r; };
+  const files = Store.list().filter(f => f.type !== "data" && !(f.type === "note" && !String(f.content || "").trim())).sort((a, b) => (b.updated || 0) - (a.updated || 0));
+  const openFile = f => shift => { closeLauncher(); if (!f.placed) Store.update(f.id, { placed: true }, "you", "open"); setTimeout(() => { if (shift || f.type === "note") desk.openFile(f.id); else setFocus(f.id); }, 40); };
+  const ago = t => { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? "now" : m < 60 ? m + " min" : m < 1440 ? Math.round(m / 60) + " h" : Math.round(m / 1440) + " d"; };
+  const kindName = f => f.kit && T.KITS[f.kit] ? (f.kit === "site" ? "Website" : T.KITS[f.kit].title) : ({ doc: "Document", table: "Spreadsheet", list: "Checklist", note: "Note", page: "Page", program: "Program", app: "App", link: "Link" })[f.type] || f.type;
+  const cmds = [["Fit everything on screen", "focus", () => { setFocus(null); desk.fit(); }], ["Switch theme", "theme", toggleTheme], ["Settings", "gear", openSettings], ["Files", "folder", () => openDrawer("files")], ["Log", "clock", () => openDrawer("log")], ["Book: how this computer works", "doc", () => openDrawer("book")], ["New desktop", "plus", () => { const id = Store.createDesk("New desktop", "you"); switchDesk(id); }], ["Export desktop", "export", exportDesk]]
+    .concat([...Store.desks.values()].filter(d => d.id !== Store.deskId).slice(0, 8).map(d => [`Go to “${d.title || d.id}”`, "home", () => switchDesk(d.id)]));
+  const parts = [];
+  if (!q) {
+    const grid = el("div", { class: "ln-grid", role: "group", "aria-label": "New" });
+    LAUNCH_NEW.forEach(([k, label, fn]) => { const i = launchRows.length, b = el("button", { type: "button", class: "ln-app", "data-i": String(i), onclick: () => launchNew(k, label, fn), onmousemove: () => { if (launchSel !== i) { launchSel = i; markLauncher(); } } }, appTile(k, 40), el("span", null, label)); launchRows.push({ el: b, run: () => launchNew(k, label, fn) }); grid.append(b); });
+    parts.push(el("h4", null, "New"), grid);
+    if (files.length) parts.push(el("h4", null, "Recent"), ...files.slice(0, 7).map(f => row(appTile(iconKind(f), 22), f.type === "note" ? String(f.content).slice(0, 80) : f.name, `${kindName(f)} · ${ago(f.updated || f.at)}`, openFile(f))));
+  } else {
+    const has = t => String(t).toLowerCase().includes(q);
+    const news = LAUNCH_NEW.filter(([k, label]) => has(label) || has("new " + label));
+    const fs = files.filter(f => has(f.type === "note" ? f.content : f.name) || has(kindName(f))).slice(0, 8);
+    const cs = cmds.filter(([t]) => has(t)).slice(0, 5);
+    if (fs.length) parts.push(el("h4", null, "On this desktop"), ...fs.map(f => row(appTile(iconKind(f), 22), f.type === "note" ? String(f.content).slice(0, 80) : f.name, `${kindName(f)} · ${ago(f.updated || f.at)}`, openFile(f))));
+    if (news.length) parts.push(el("h4", null, "New"), ...news.map(([k, label, fn]) => row(appTile(k, 22), "New " + label.replace(/…$/, ""), k === "app" ? "describe it, Claude builds it" : null, () => launchNew(k, label, fn))));
+    if (cs.length) parts.push(el("h4", null, "Commands"), ...cs.map(([t, ic, fn]) => row(el("i", { class: "ln-ic" }, svgIcon(ic)), t, null, () => { closeLauncher(); fn(); })));
+    const raw = $("ln-q").value.trim();
+    parts.push(el("h4", null, "Claude"), row(el("i", { class: "ln-ic claude" }, svgIcon("claude")), `Ask Claude: “${raw}”`, canSend() ? "in the chat" : "on this page", () => { closeLauncher(); if (canSend()) toClaudeFromApp(raw, {}, "Launcher"); else ask(raw); }, "ask"));
+  }
+  body.replaceChildren(...parts);
+  launchSel = Math.min(launchSel, launchRows.length - 1); markLauncher();
+}
+function markLauncher() { launchRows.forEach((r, i) => r.el.setAttribute("aria-selected", String(i === launchSel))); const cur = launchRows[launchSel]; if (cur) cur.el.scrollIntoView({ block: "nearest" }); }
+$("ln-q").addEventListener("input", () => { launchSel = 0; renderLauncher(); });
+$("ln-q").addEventListener("keydown", e => {
+  e.stopPropagation();
+  const grid = !$("ln-q").value.trim(), cols = 6, n = launchRows.length, inGrid = grid && launchSel < LAUNCH_NEW.length;
+  if (e.key === "Escape") { e.preventDefault(); closeLauncher(); return; }
+  if (e.key === "ArrowDown") { e.preventDefault(); launchSel = inGrid ? Math.min(n - 1, launchSel + cols >= LAUNCH_NEW.length ? LAUNCH_NEW.length : launchSel + cols) : Math.min(n - 1, launchSel + 1); markLauncher(); }
+  if (e.key === "ArrowUp") { e.preventDefault(); launchSel = inGrid ? Math.max(0, launchSel - cols) : grid && launchSel === LAUNCH_NEW.length ? LAUNCH_NEW.length - cols : Math.max(0, launchSel - 1); markLauncher(); }
+  if (inGrid && e.key === "ArrowRight") { e.preventDefault(); launchSel = Math.min(LAUNCH_NEW.length - 1, launchSel + 1); markLauncher(); }
+  if (inGrid && e.key === "ArrowLeft") { e.preventDefault(); launchSel = Math.max(0, launchSel - 1); markLauncher(); }
+  if (e.key === "Enter") { e.preventDefault(); const r = launchRows[launchSel]; if (r) r.run(e.shiftKey); }
+});
+$("launcher").addEventListener("pointerdown", e => { if (e.target === $("launcher")) closeLauncher(); });
+$("launch-btn").addEventListener("click", () => openLauncher());
+/* the computer's keys stay off Claude's own (⌘K, ⌘N, ⌘/ … belong to the app around this page):
+   plain keys, only when nobody is typing. / opens the launcher, F focuses the selected app, Esc leaves. */
+document.addEventListener("keydown", e => {
+  const mod = e.metaKey || e.ctrlKey || e.altKey, typing = e.target.closest && e.target.closest("textarea, input, select, [contenteditable=\"true\"], [contenteditable=\"plaintext-only\"], .k-canvas.live, .sg-grid");
+  if (mod || typing || menuOpen || !$("launcher").hidden || document.querySelector("dialog[open]")) { if (e.key === "Escape" && focusId && !typing && !menuOpen && $("launcher").hidden) { e.preventDefault(); setFocus(null); } return; }
+  if (e.key === "/") { e.preventDefault(); openLauncher(); return; }
+  if ((e.key === "f" || e.key === "F") && (focusId || desk.sel) && (Store.files.get(focusId || desk.sel) || {}).type !== "note") { e.preventDefault(); setFocus(focusId ? null : desk.sel); return; }
+  if (e.key === "Escape" && focusId) { e.preventDefault(); setFocus(null); }
+}, true);
+
+/* ==========================================================================
+   PROMPT BAR · Enter captures a note, ⌘/Ctrl+Enter asks Claude
+   ========================================================================== */
+const prompt = $("prompt");
+const grow = () => { prompt.style.height = "auto"; prompt.style.height = Math.min(140, prompt.scrollHeight) + "px"; };
+prompt.addEventListener("input", grow);
+prompt.addEventListener("keydown", e => {
+  e.stopPropagation();
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); askFromBar(); return; }
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); captureFromBar(); }
+});
+$("add-btn").addEventListener("click", captureFromBar);
+$("bar").addEventListener("submit", e => { e.preventDefault(); askFromBar(); });
+function captureFromBar() {
+  const raw = prompt.value.trim(); if (!raw) return;
+  const p = T.parseCapture(raw); if (!p.text) return;
+  const f = Store.add(Object.assign({ type: "note", content: p.text, kind: p.kind, tags: p.tags, done: p.done, placed: false }, p.url ? { url: p.url } : {}), "you");
+  prompt.value = ""; grow(); desk.select(f.id);
+}
+function askFromBar() { if ($("ask-btn").disabled) return; const v = prompt.value.trim(); if (!v) return; prompt.value = ""; grow(); ask(v); }
+document.addEventListener("keydown", e => {
+  if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z" || e.altKey) return;
+  if (e.target.closest && e.target.closest("textarea, input, select, [contenteditable=\"true\"], [contenteditable=\"plaintext-only\"]")) return;
+  e.preventDefault(); const f = Store.undoMine(e.shiftKey);
+  toast(f ? `${e.shiftKey ? "Redid" : "Undid"} a change to “${String(f.name).replace(/ · data$/, "").slice(0, 40)}”.` : `Nothing to ${e.shiftKey ? "redo" : "undo"}.`);
+});
+$("thread-btn").addEventListener("click", () => { $("thread").hidden = !$("thread").hidden; if (!$("thread").hidden) $("messages").scrollTop = 1e9; });
+$("thread-close").addEventListener("click", () => ($("thread").hidden = true));
+
+/* ==========================================================================
+   AGENT · Claude built in first (the artifact's sample capability), then the
+   Anthropic API, then any OpenAI-compatible endpoint. The reply carries
+   prose, optional ```app Name blocks (whole programs) and an optional
+   ```files JSON array; the page applies both.
+   ========================================================================== */
+const settings = Object.assign({ prefer: "auto", akey: "", amodel: "claude-sonnet-5-5", obase: "", okey: "", omodel: "", follow: true }, local.get("settings", {}));
+let sample = null, sampleChecked = false, lastModel = null;
+function providers() {
+  const all = [
+    { id: "builtin", label: "Claude · built in", ok: !!sample },
+    { id: "anthropic", label: `Anthropic · ${settings.amodel || "model?"}`, ok: !!(settings.akey && settings.amodel) },
+    { id: "openai", label: `OpenAI-compatible · ${settings.omodel || "model?"}`, ok: !!(settings.obase && settings.omodel) },
+  ];
+  const pref = settings.prefer, order = pref === "auto" || pref === "builtin" ? all : [all.find(p => p.id === pref)].concat(all.filter(p => p.id !== pref));
+  return order.filter(p => p.ok);
+}
+function renderModel() {
+  const ps = providers(), cur = lastModel || (ps[0] && ps[0].label) || (sampleChecked ? "No model" : "…");
+  $("bar-model").textContent = cur; $("thread-model").textContent = cur;
+  $("bar-model").title = ps.length ? `Asking: ${cur}. Fallbacks: ${ps.slice(1).map(x => x.label).join(", ") || "none"}.` : "No model is available. Open Settings to add one.";
+}
+async function* sse(res, pick) {
+  const reader = res.body.getReader(), dec = new TextDecoder(); let buf = "";
+  for (;;) { const { value, done } = await reader.read(); if (done) break; buf += dec.decode(value, { stream: true }); let i;
+    while ((i = buf.indexOf("\n")) >= 0) { const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1); if (!line.startsWith("data:")) continue; const data = line.slice(5).trim(); if (data === "[DONE]") return; let j; try { j = JSON.parse(data); } catch (e) { continue; } if (j && j.type === "error") throw new Error((j.error && j.error.message) || "stream error"); const d = pick(j); if (d) yield d; } }
+}
+async function callProvider(p, system, user, onText, signal, extra) {
+  if (p.id === "builtin") { const o = { onText: ({ text }) => onText(text), cache: !!(extra && extra.cache), modelTier: "default" }; if (signal) o.signal = signal; const r = await sample(system + "\n\n" + user, o); return { text: r.text, truncated: !!r.truncated, label: "Claude · built in" }; }
+  let res, text = "";
+  if (p.id === "anthropic") {
+    res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", signal, headers: { "Content-Type": "application/json", "x-api-key": settings.akey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" }, body: JSON.stringify({ model: settings.amodel, max_tokens: 8000, system, messages: [{ role: "user", content: user }], stream: true }) });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`);
+    for await (const d of sse(res, j => j.type === "content_block_delta" && j.delta && j.delta.type === "text_delta" ? j.delta.text : "")) { text += d; onText(text); }
+  } else {
+    res = await fetch(settings.obase.replace(/\/+$/, "") + "/chat/completions", { method: "POST", signal, headers: Object.assign({ "Content-Type": "application/json" }, settings.okey ? { Authorization: "Bearer " + settings.okey } : {}), body: JSON.stringify({ model: settings.omodel, messages: [{ role: "system", content: system }, { role: "user", content: user }], stream: true }) });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`);
+    for await (const d of sse(res, j => { const c = j.choices && j.choices[0]; return c ? (c.delta && c.delta.content) || "" : ""; })) { text += d; onText(text); }
+  }
+  if (!text) throw new Error("empty reply");
+  return { text, label: p.label };
+}
+async function complete(system, user, onText, signal, note, extra) {
+  const ps = providers(); if (!ps.length) throw new Error("No model is available here. Open Settings to add an Anthropic key or an OpenAI-compatible endpoint, or open this canvas inside Claude.");
+  let lastErr = null;
+  for (const p of ps) {
+    try { const r = await callProvider(p, system, user, onText, signal, extra); lastModel = r.label; renderModel(); return r; }
+    catch (e) {
+      // a stop is a stop, and a refusal is an answer: neither goes on to the next model
+      if (e && (e.name === "AbortError" || e.code === "cancelled" || e.code === "refused")) throw e;
+      lastErr = e; note(`${p.label} is unavailable (${(e && (e.code || e.message)) || e}).${ps.indexOf(p) < ps.length - 1 ? " Trying the next model." : ""}`);
+      if (p.id === "builtin" && e && ["not_granted", "sampling_disabled", "capability_disabled", "capability_removed", "not_declared"].includes(e.code)) sample = null;
+      renderModel();
+    }
+  }
+  throw lastErr || new Error("No model answered.");
+}
+const SYSTEM = () => [
+  "You are Claude, working on the desktop of Claude Computer: a small cloud computer that a person and Claude share for one conversation. The desktop is a spatial canvas of files (notes, docs, lists, tables, data, links, pages) and apps. Apps are Tanke programs, a small JavaScript DSL, that render in frames and read and change files by name.",
+  "The person watches you write. Every block you open appears on the canvas where it will land and fills in as you type; when the block closes it becomes a real file.",
+  "Several people may have this desktop open at once, each with their own Claude; the context says who is here and who made what. You work for the person asking. In apps, c.me is the person using the app, c.people who is here now, and c.my(key) / c.setMy(key, v) / c.everyone(key) keep one value per person (votes, picks, answers) that everyone can see; built-in polls, quizzes, forms and cards already keep each person's answers apart.",
+  "",
+  "How to answer:",
+  "1. Start with one or two short plain sentences saying what you are doing. Text outside blocks shows in the chat beside the bar.",
+  "2. Then write blocks. A block starts with a header line beginning with @@ and ends at a line @@end (or at the next header):",
+  "   @@note <kind> <text> #tags      kinds: note idea question decision task quote source; the text can also go on the lines below",
+  "   @@doc <Name>                    text; markdown is fine",
+  "   @@list <Name>                   one item per line: - [ ] item   or   - [x] done item",
+  "   @@table <Name>                  a pipe table, header row first; cells starting with = compute (=SUM(B1:B4), =B2*C2)",
+  "   @@data <Name>                   JSON",
+  "   @@link <Name>                   the address on one line, a title on the next",
+  "   @@page <Name>                   one small complete HTML page; inline CSS and JS only, no external files",
+  "   @@app <Name>                    one COMPLETE Tanke program (see the textbook)",
+  "   @@program <Name>                JavaScript that really runs: the body of an async function with print, read, write, append, files, note, sleep, ask, run and input (see the Programs chapter)",
+  "   @@run <Name>                    run a program now, after the blocks above have landed; optional body: its input as JSON",
+  "   @@append <Name>                 add text to a doc, items to a list or rows to a table",
+  "   @@delete <Name>",
+  "   @@open <Name>                   bring a file into view (puts it back on the desktop if tucked away); @@tuck <Name> puts it away; @@move <Name> @ x,y moves it",
+  "   Built-in apps, content only, no code (prefer these over @@app):",
+  "   @@quiz <Name>  ? question / - option / * right option / > why      @@poll <Name> · multi  question, then - options",
+  "   @@form <Name>  intro, then - Label: text|long|number|date|email|yes|choice (a, b)     @@chart <Name> · line  a pipe table",
+  "   @@board <Name>  ## Column, then - cards     @@timeline <Name>  - when: what     @@cards <Name> · pick  ## Title, Key: value, body",
+  "   @@slides <Name>  markdown split by ---     @@canvas <Name> · tb  [Box] (Round) <Decision?> note: text #yellow, A -> B: label     @@site <Name>  markdown website",
+  "   @@sheet <Name> is a table whose =SUM(B1:B3) cells compute; @@doc is markdown and shows formatted; @@records <Name> is a pipe table of records (a database apps and programs use by name).",
+  "   Add \"@ x,y\" at the end of a header to put the file at that spot; without it the file lands in a free spot near the person's view. Notes without a spot go to the Inbox or into an app that claims them.",
+  "3. A block with the name of an existing file of the same type replaces that file's content. For small additions use @@append.",
+  "Rules: make files for content and apps for behaviour. Apps refer to files with file(\"Name\", { type, seed }) and edit them with textedit, checklist, sheet, inspect, or change them in act(c => c.write(\"Name\", value | old => new)). Never copy notes into app code; use stream(filter). In an action, c.claude(say, data) hands the turn to Claude in the chat with what the app holds. One app() per program, under 70 lines, only functions from the reference. Several focused files beat one huge one; write the most useful block first. Keep what the person already has unless asked.",
+  "The textbook below is the full reference for the desktop and for Tanke; the compact reference is at its end.",
+  "<textbook>", DOCS, "</textbook>",
+].join("\n");
+const clip = (s, n) => { s = String(s ?? ""); return s.length > n ? s.slice(0, n) + "\n…(" + (s.length - n) + " more characters)" : s; };
+/* who did something, said to the canvas Claude of the person at this page */
+function canvasWho(by, who) {
+  const me = Store.me.id;
+  if (by === "agent") return !who || who === me ? "you" : `${pname(who)}’s canvas Claude`;
+  if (by === "claude") return who ? `${pname(who)}’s Claude (in their chat)` : "Claude (in the chat)";
+  return !who ? "the person" : who === me ? `${pname(me)} (who is asking you)` : pname(who);
+}
+function fileAsBlock(f) {
+  if (f.kit && T.KITS[f.kit]) {
+    if (f.type === "app") return `@@${f.kit} ${f.name} (id ${f.id} · by ${canvasWho(f.by, f.who)} · built-in app ${f.placed ? `at ${Math.round(f.x)},${Math.round(f.y)}` : "tucked away"}; its content is the @@${f.kit} block below)`;
+    if (f.type === "data") { const K = T.KITS[f.kit], c = f.content || {}, sc = Store.markScope("f", f.id); return `@@${f.kit} ${f.name.replace(/ · data$/, "")}${T.kitVariant(f.kit, c) ? " · " + T.kitVariant(f.kit, c) : ""} (id ${f.id} · data)\n${clip(K.encode(c), 4000)}\n@@end\nstate: ${K.state(c, Store.marksFor(sc).map(m => ({ name: canvasWho("you", m.id), v: m.v })))}`; }
+  }
+  const where = f.type === "note" ? (f.placed ? `placed at ${Math.round(f.x)},${Math.round(f.y)}` : desk.owner.has(f.id) ? "inside an app" : "in the Inbox") : f.placed ? `on the desktop at ${Math.round(f.x)},${Math.round(f.y)}` : "tucked away";
+  const meta = `(id ${f.id} · by ${canvasWho(f.by, f.who)} · ${where}${f.done ? " · done" : ""}${(f.links || []).length ? " · links " + f.links.join(",") : ""})`;
+  const tags = (f.tags || []).map(x => " #" + x).join("");
+  if (f.type === "note") return `@@note ${f.kind || "note"}${tags} ${meta}\n${clip(f.content, 300)}\n@@end`;
+  return `@@${f.type} ${f.name}${tags} ${meta}\n${clip(T.encodeBody(f.type, f.content), f.type === "app" || f.type === "page" ? 5000 : 1500)}\n@@end`;
+}
+/* newest files first until the budget is spent: the prompt never outgrows what the model takes */
+function budgetBlocks(limit) {
+  const all = Store.list().slice().reverse(), out = []; let left = limit;
+  for (let k = 0; k < all.length; k++) { const b = fileAsBlock(all[k]); if ((left -= b.length) < 0) { out.push(`(${all.length - k} older files not shown)`); break; } out.push(b); }
+  return out.reverse().join("\n\n");
+}
+function contextFor(request, history) {
+  const ev = Store.events.filter(e => e.op !== "chat").slice(0, 30).map(e => `${new Date(e.at).toLocaleString()} · ${canvasWho(e.by, e.who)} · ${e.op === "act" ? "" : e.op + ": "}${e.text}`);
+  const others = peopleNow().filter(p => !p.isMe);
+  const sel = desk.sel && Store.files.get(desk.sel), c = desk.viewCenter();
+  return [
+    `Desktop: “${Store.desk().title}”. ${Store.me.id ? `You work for ${pname(Store.me.id)}. ` : ""}The person's view is centred at ${Math.round(c.x)},${Math.round(c.y)}.`,
+    others.length ? `Also here now: ${others.map(p => `${p.name}${placeOf(p) ? " (" + placeOf(p) + ")" : ""}`).join("; ")}. They see what you make as it lands.` : "",
+    sel ? `The person has selected: ${sel.type} “${sel.name}” (id ${sel.id}).` : "",
+    `The desktop now, written in the same block format (${Store.files.size} files; ids and places in brackets are for you, never repeat them in headers):`,
+    budgetBlocks(150000) || "(an empty desktop)",
+    "Recent log, newest first:", ev.join("\n") || "(empty)",
+    history.length ? "Our chat so far:\n" + history.map(m => `${m.role === "you" ? "Person" : "You"}: ${m.text}`).join("\n") : "",
+    "Request: " + request,
+  ].filter(Boolean).join("\n");
+}
+
+/* ==========================================================================
+   RUNS · one streamed answer, drawn block by block while it is written.
+   A run parses the WHOLE text on every token (T.parseStream is pure), shows
+   each open block as a draft where it will land, and, when it is allowed to
+   commit, turns each closed block into a real file exactly once. The canvas
+   agent's runs commit; runs read from Claude in the chat (the live document)
+   only draw, because chat-Claude writes its own files.
+   ========================================================================== */
+const findTarget = (name, type) => { const n = String(name || "").trim(); if (!n) return null; return Store.files.get(n) || (type ? Store.byName(n, type) : null) || Store.list().find(f => f.name === n && f.type !== "app") || Store.list().find(f => f.name.toLowerCase() === n.toLowerCase()) || null; };
+class Run {
+  constructor(o) { this.o = o; this.slots = new Map(); this.done = new Set(); this.results = []; this.failedApps = []; this.current = null; this.text = ""; }
+  slot(b) {
+    const id = b.i + ":" + (b.op === "write" ? b.type : b.op);
+    let s = this.slots.get(id); if (s) return s;
+    const t = b.op === "write" || b.op === "kit" ? b.type : null, existing = b.op === "write" ? (t === "note" ? null : findTarget(b.name, t)) : b.op === "kit" ? Store.byName(b.name, "app") : findTarget(b.target);
+    const ty = t || (existing && existing.type) || "doc", sz = b.op === "kit" && T.KITS[b.kit] ? T.KITS[b.kit].size : T.DEFAULT_SIZE[ty] || [320, 240];
+    if (b.at) { s = { x: b.at[0], y: b.at[1] }; if (b.size) { s.w = b.size[0]; s.h = b.size[1]; } }
+    else if (existing && existing.placed && existing.type !== "note") s = { x: existing.x, y: existing.y, w: existing.w, h: existing.h, edit: true };
+    else { const w = ty === "note" ? 220 : sz[0], h = ty === "note" ? 110 : sz[1]; s = desk.freeSpot(w, h); desk.reserve(s.x, s.y, w, h); s.w = b.op === "kit" ? w : undefined; s.h = b.op === "kit" ? h : undefined; }
+    s.type = ty; s.existing = existing ? existing.id : null; s.isNew = true;
+    this.slots.set(id, s); return s;
+  }
+  update(text, final) {
+    this.text = text; const p = T.parseStream(text, final), o = this.o;
+    this.prose = p.prose; this.current = null;
+    for (const b of p.blocks) {
+      const key = o.prefix + b.i;
+      if (this.done.has(b.i)) continue;
+      if (T.ACTION_OPS.includes(b.op)) { if (b.closed && o.commit) { this.done.add(b.i); this.results.push(commitBlock(b, null, o.by)); } continue; }
+      const s = this.slot(b);
+      if (b.closed && o.commit) { this.done.add(b.i); const r = commitBlock(b, s, o.by); this.results.push(r); if (!r.ok && r.app) this.failedApps.push(r); desk.clearDraft(key); continue; }
+      if (b.closed && o.landed && o.landed(b)) { desk.clearDraft(key); continue; }
+      desk.draft(key, { op: b.op, type: s.type, kind: b.kind, kit: b.kit, variant: b.variant, name: b.op === "write" || b.op === "kit" ? b.name : b.target, body: b.body, tags: b.tags, x: s.x, y: s.y, w: s.w, h: s.h, edit: !!s.edit, closed: b.closed, who: o.who });
+      if (s.isNew) { s.isNew = false; if (follow()) desk.glideTo(s.x, s.y, s.w || 360, s.h || 240); }
+      if (!b.closed) this.current = { name: b.op === "write" || b.op === "kit" ? (b.name || (b.kind || "note")) : b.target, type: b.op === "kit" ? b.kit : s.type, op: b.op, slot: s };
+    }
+    // blocks that vanished from a rewritten stream (the live doc can be replaced) leave no ghosts
+    for (const k of [...desk.drafts.keys()]) if (k.startsWith(o.prefix) && !p.blocks.some(b => o.prefix + b.i === k && !this.done.has(b.i))) desk.clearDraft(k);
+    return p;
+  }
+  end() { desk.clearDrafts(this.o.prefix); }
+}
+const follow = () => settings.follow !== false;
+function commitBlock(b, s, by) {
+  try {
+    if (b.op === "run") {
+      const f = Store.byName(b.target, "program"); if (!f) return { ok: false, text: `No program called “${b.target}”` };
+      const input = b.body.trim() ? T.decodeBody("data", b.body) : null;
+      // code from Claude in the chat runs only when the person says so: it asks, with a Run button on the program
+      if (by === "claude") { Store.update(f.id, { runRequest: Object.assign({ at: Date.now(), by: "claude", input }, Store.actingAs() ? { who: Store.actingAs() } : {}) }, "claude", false); setTimeout(() => desk.spotlight(f.id, follow()), 60); return { ok: true, id: f.id, text: `Asked to run “${f.name}”` }; }
+      desk.runner.run(f.id, { by, input }).then(r => toast(r.ok ? `“${f.name}” finished.` : `“${f.name}”: ${r.error}`));
+      return { ok: true, id: f.id, text: `Running “${f.name}”` };
+    }
+    if (b.op === "delete") { const f = findTarget(b.target); if (!f) return { ok: false, text: `Nothing called “${b.target}” to delete` }; Store.remove(f.id, by); return { ok: true, text: `Deleted “${f.type === "note" ? String(f.content).slice(0, 30) : f.name}”` }; }
+    // attention: Claude can bring a file into view, put it away or move it, as a person would
+    if (b.op === "open" || b.op === "tuck" || b.op === "move") {
+      const f = findTarget(b.target); if (!f) return { ok: false, text: `Nothing called “${b.target}” to ${b.op}` };
+      const label = f.type === "note" ? "the note" : `“${f.name}”`;
+      if (b.op === "tuck") { if (f.placed) Store.update(f.id, { placed: false }, by, "tuck"); return { ok: true, id: f.id, text: `Tucked away ${label}` }; }
+      if (b.op === "move" || !f.placed) {
+        const d = T.DEFAULT_SIZE[f.type] || [300, 220], at = b.at ? { x: b.at[0], y: b.at[1] } : desk.freeSpot(f.w || d[0], f.h || d[1]);
+        Store.update(f.id, Object.assign({ placed: true, x: Math.round(at.x), y: Math.round(at.y) }, b.size ? { w: b.size[0], h: b.size[1] } : {}), by, b.op === "move" ? "move" : "open");
+      }
+      if (b.op === "open") setTimeout(() => desk.spotlight(f.id, follow()), 60);
+      return { ok: true, id: f.id, text: b.op === "move" ? `Moved ${label}` : `Opened ${label}` };
+    }
+    if (b.op === "kit") return commitKit(b, s, by);
+    if (b.op === "append") {
+      const f = findTarget(b.target);
+      if (f && f.type === "app" && f.kit && T.KITS[f.kit]) { const K = T.KITS[f.kit], df = Store.byName(f.name + " · data", "data"); if (df) { Store.update(df.id, { content: K.merge(df.content || {}, K.parse(b.body, "")) }, by, "edit"); return { ok: true, id: f.id, text: `Added to “${f.name}”` }; } }
+      if (!f) return commitBlock(Object.assign({}, b, { op: "write", type: "doc", name: b.target }), s, by);
+      let next = f.content;
+      if (f.type === "list") next = (Array.isArray(f.content) ? f.content : []).concat(T.decodeBody("list", b.body));
+      else if (f.type === "table") { const t = f.content && typeof f.content === "object" ? f.content : { cols: [], rows: [] }; next = Object.assign({}, t, { rows: (t.rows || []).concat(T.decodeBody("table", b.body, true)) }); }
+      else if (f.type === "data" && Array.isArray(f.content)) { const v = T.decodeBody("data", b.body); next = f.content.concat(Array.isArray(v) ? v : [v]); }
+      else next = (String(f.content ?? "").replace(/\s+$/, "") + "\n" + b.body).replace(/^\n/, "");
+      Store.update(f.id, { content: next }, by, "edit"); return { ok: true, id: f.id, text: `Added to “${f.name}”` };
+    }
+    if (b.type === "note") {
+      if (!b.body.trim()) return { ok: false, text: "An empty note was skipped" };
+      const p = T.parseCapture(b.body), kind = b.kind && b.kind !== "note" ? b.kind : p.kind;
+      const f = Store.add(Object.assign({ type: "note", content: p.text, kind, tags: [...new Set(b.tags.concat(p.tags))], done: p.done, placed: !!b.at, x: b.at ? b.at[0] : 0, y: b.at ? b.at[1] : 0 }, p.url ? { url: p.url } : {}), by);
+      return { ok: true, id: f.id, text: `${T.KIND_LABEL[kind] || "Note"}: ${p.text.slice(0, 40)}` };
+    }
+    const name = b.name || (b.type === "app" ? ((b.body.match(/(?:app|space)\(\s*["'`]([^"'`]+)["'`]/) || [])[1] || "Untitled app") : "");
+    // checking an app compiles it, which runs it: only for code this person's own Claude or canvas agent writes
+    const mine = Store.mode !== "db" || !Store.me.id || Store.actingAs() === Store.me.id;
+    if (b.type === "app" && mine) { const c = T.compile(b.body, {}); if (c.errors.length) return { ok: false, app: true, name, code: b.body, errors: c.errors.map(e => e.toJSON()), text: `App “${name}” failed to build` }; }
+    const content = T.decodeBody(b.type, b.body), existing = name ? Store.byName(name, b.type) : null;
+    if (existing) {
+      const patch = { content }; if (b.tags.length) patch.tags = [...new Set((existing.tags || []).concat(b.tags))];
+      if (!existing.placed && s) Object.assign(patch, { placed: true, x: Math.round(s.x), y: Math.round(s.y) });
+      if (b.at) Object.assign(patch, { placed: true, x: b.at[0], y: b.at[1] }); if (b.size) Object.assign(patch, { w: b.size[0], h: b.size[1] });
+      Store.update(existing.id, patch, by, b.type === "app" ? "program" : "edit"); return { ok: true, id: existing.id, text: `${T.TYPE_LABEL[b.type]} “${existing.name}” rewritten` };
+    }
+    const f = Store.add(Object.assign({ type: b.type, name: name || undefined, content, tags: b.tags, placed: true, x: Math.round(s ? s.x : 0), y: Math.round(s ? s.y : 0) }, b.size ? { w: b.size[0], h: b.size[1] } : {}), by);
+    return { ok: true, id: f.id, text: `${T.TYPE_LABEL[b.type]} “${f.name}”` };
+  } catch (e) { console.error(e); return { ok: false, text: `Could not apply a block: ${e.message}` }; }
+}
+
+/* a built-in app: its content goes to "<Name> · data", its app is one line that shows it */
+function commitKit(b, s, by) {
+  const K = T.KITS[b.kit]; if (!K) return { ok: false, text: `No built-in app called ${b.kit}` };
+  let name = b.name || K.title; const dataName = name + " · data", df = Store.byName(dataName, "data");
+  // a rewrite keeps what people did (answers, picks, values, places, record ids)
+  const data = T.kitCarry(b.kit, df && df.content, K.parse(b.body, b.variant), b.variant);
+  if (data.nodes) data.nodes.forEach(n => delete n.auto);
+  if (df) Store.update(df.id, { content: data, kit: b.kit }, by, "edit"); else Store.add({ type: "data", name: dataName, content: data, placed: false, kit: b.kit }, by);
+  const code = T.kitCode(b.kit, name), app = Store.byName(name, "app");
+  if (app) {
+    const patch = { kit: b.kit }; if (app.kit && String(app.content) !== code) patch.content = code;
+    if (b.at) Object.assign(patch, { placed: true, x: b.at[0], y: b.at[1] }); else if (!app.placed && s) Object.assign(patch, { placed: true, x: Math.round(s.x), y: Math.round(s.y) }); if (b.size) Object.assign(patch, { w: b.size[0], h: b.size[1] });
+    Store.update(app.id, patch, by, "edit"); return { ok: true, id: app.id, text: `${K.title} “${name}” rewritten` };
+  }
+  const f = Store.add({ type: "app", name, content: code, kit: b.kit, placed: true, x: Math.round(s ? s.x : 0), y: Math.round(s ? s.y : 0), w: (b.size || K.size)[0], h: (b.size || K.size)[1] }, by);
+  return { ok: true, id: f.id, text: `${K.title} “${f.name}”` };
+}
+/* a new built-in app from the menu, filled with a small sample */
+function newKit(kit, at) {
+  const K = T.KITS[kit]; let name = K.title, i = 2; while (Store.byName(name, "app")) name = K.title + " " + i++;
+  const spot = at ? { x: Math.round(at.x), y: Math.round(at.y) } : desk.freeSpot(K.size[0], K.size[1]);
+  const r = commitKit({ op: "kit", kit, name, body: T.KIT_SAMPLES[kit] || "", variant: kit === "cards" ? "pick" : "", tags: [], at: [spot.x, spot.y] }, spot, "you");
+  if (r.id) setTimeout(() => desk.reveal(r.id), 60);
+}
+
+/* ---------- the live chip: who is writing what, right now ---------- */
+const liveState = { canvas: null, turn: null, chat: null };
+function renderLiveChip() {
+  const chip = $("live"), s = liveState.canvas || liveState.turn || liveState.chat;
+  document.body.classList.toggle("claude-busy", !!s);
+  if (!s) { chip.hidden = true; return; }
+  chip.hidden = false; chip.classList.toggle("chat", !liveState.canvas);
+  $("live-who").textContent = s.who; $("live-what").textContent = s.what;
+}
+$("live").addEventListener("click", () => { const r = (liveState.canvas && liveState.canvas.run) || (liveState.turn && liveState.turn.run) || (liveState.chat && liveState.chat.run); const cur = r && r.current; if (cur && cur.slot) desk.glideTo(cur.slot.x, cur.slot.y, cur.slot.w || 360, cur.slot.h || 240); });
+const describeCurrent = (r, fallback) => { const c = r && r.current; if (!c) return fallback; const verb = c.op === "append" ? "adding to" : c.slot && c.slot.edit ? "rewriting" : "writing"; return c.type === "note" ? `${verb} a ${c.name === "note" ? "note" : c.name}` : `${verb} ${T.TYPE_LABEL[c.type] ? T.TYPE_LABEL[c.type].toLowerCase() + " " : ""}“${c.name}”`; };
+
+/* ---------- Claude in the chat, made visible: desks/{id}/live/claude ---------- */
+let chatRun = null, chatRunKey = "";
+function renderChatLive() {
+  const L = Store.live, fresh = L && L.state && L.state !== "idle" && Date.now() - (L.at || 0) < 20 * 60 * 1000;
+  if (!fresh) { if (chatRun) { chatRun.end(); chatRun = null; } liveState.chat = null; renderLiveChip(); return; }
+  const key = String(L.started || L.run || "");
+  if (!chatRun || chatRunKey !== key) { if (chatRun) chatRun.end(); chatRunKey = key; chatRun = new Run({ prefix: "chat:" + key + ":", commit: false, by: "claude", who: "Claude · chat", landed: b => landedSince(b, L.started || L.at || 0) }); }
+  chatRun.update(String(L.stream || ""), false);
+  liveState.chat = { who: "Claude · chat", what: L.text ? String(L.text).slice(0, 140) : describeCurrent(chatRun, L.state === "thinking" ? "thinking…" : "working…"), run: chatRun };
+  renderLiveChip();
+}
+function landedSince(b, since) {
+  if (b.op === "write" && b.type === "note") return Store.list().some(f => f.type === "note" && (f.at || 0) >= since - 5000 && String(f.content).trim().slice(0, 40) === T.parseCapture(b.body).text.slice(0, 40));
+  const f = findTarget(b.op === "write" ? b.name : b.target, b.op === "write" ? b.type : null);
+  return b.op === "delete" ? !f : !!f && (f.updated || f.at || 0) >= since - 5000;
+}
+setInterval(() => { if (Store.live && Store.live.state && Store.live.state !== "idle") renderChatLive(); }, 30000);
+
+/* ==========================================================================
+   CLAUDE IN THE CHAT · two calls a turn, and a channel for each person's Claude.
+   A person's Claude reads its own view, data/users/{me}/claude-{desk}
+   (ArtifactData: collection "data/users/me", doc_id "claude-{desk}"), which
+   that person's page keeps current: what everyone changed since this Claude
+   last read, the files that changed, the index of every file, who is here
+   and what each of them looks at, and what happened to its last turn.
+   It writes a turn to data/users/{me}/claude-{desk}/turns/{next}: { text }.
+   The person's own page claims the turn and plays it in as their Claude at
+   work (drafts where things land, a marker where it is, prose as it
+   speaking; everyone else sees "Ana's Claude" there), commits each block,
+   records what landed, moves that Claude's read cursor and refreshes its
+   view. An editor's Claude may still use the shared channel, claude/{desk}
+   and claude/{desk}/turns: editors' pages play those.
+   Only pages write files and events, so nothing a Claude writes can break
+   the desktop, and every change a Claude makes can be undone.
+   ========================================================================== */
+const MSn = x => typeof x === "number" && isFinite(x) ? x : (Date.parse(x) || 0);
+const turnName = n => "t" + String(n).padStart(4, "0");
+const chanKind = () => Store.channel().kind; // "mine" when this page knows who you are, else "shared"
+function nextTurn(kind) { kind = kind || chanKind(); let n = 0; for (const t of Store.turns) { if (t.ch !== kind) continue; const m = /(\d+)$/.exec(t.id); if (m) n = Math.max(n, +m[1]); } return turnName(n + 1); }
+let turnBusy = false, activeTurnFlush = null; const viewAsOf = { mine: 0, shared: 0 }, writtenAsOf = { mine: 0, shared: 0 };
+/* turns this device has played, by path: a turn never lands twice here, whatever happened to its "applied" */
+const played = { get() { try { return JSON.parse(localStorage.getItem("cc.played") || "{}"); } catch (e) { return {}; } },
+  has(p) { return !!this.get()[p]; },
+  add(p) { const m = this.get(), now = Date.now(); m[p] = now; for (const k of Object.keys(m)) if (now - m[k] > 14 * 864e5) delete m[k]; try { localStorage.setItem("cc.played", JSON.stringify(m)); } catch (e) {} this.mem.add(p); },
+  mem: new Set() };
+const skipUntil = new Map();
+/* this page plays my Claude's turns, and on an editor's page the shared channel's too */
+const playable = t => t.ch === "mine" || Store.me.canEdit !== false;
+const turnWho = t => t && t.ch === "mine" ? Store.me.id : "";
+const turnLabel = t => "Claude" + (t && t.agent ? " · " + t.agent : t && t.ch === "shared" && Store.me.id ? " · shared" : "");
+async function pumpTurns() {
+  if (turnBusy || Store.mode !== "db" || !Store.ready) return;
+  if (!fitted) { clearTimeout(pumpTurns.t); pumpTurns.t = setTimeout(pumpTurns, 300); return; } // land turns on a drawn desktop
+  const now = Date.now(), t = Store.turns.find(x => playable(x) && !x.applied && x.text !== null && !played.mem.has(x.path) && !played.has(x.path) && !((skipUntil.get(x.path) || 0) > now));
+  renderPending();
+  if (!t) return;
+  turnBusy = true;
+  let v = null;
+  try { v = await Store.claimTurn(t, { alone: !peers.some(p => p.isMe && !p.sameTab && p.presence && p.presence.app === "claude-computer"), settled: liveStatus.room === "connected" && liveStatus.since && Date.now() - liveStatus.since > 3000 }); } catch (e) { v = null; }
+  if (!v) { turnBusy = false; skipUntil.set(t.path, Date.now() + 8000); setTimeout(pumpTurns, 8200); renderPending(); scheduleView(); return; }
+  played.add(t.path);
+  try { await playTurn(t, String(v.text), MSn(v.read)); }
+  catch (e) { console.error(e); Store.finishTurn(t, { at: Date.now(), by: Store.tab, ok: false, results: ["✗ " + ((e && e.message) || e)], errors: [] }); }
+  turnBusy = false; setTimeout(pumpTurns, 150);
+}
+/* the text arrives whole; it is played in at reading speed (a hidden tab lands it at once) */
+function playTurn(t, text, read) {
+  if (typeof t === "string") t = { id: t, ch: chanKind(), path: null, agent: null }; // a turn from the window API
+  return new Promise(resolve => {
+    // how far this Claude has read: what its turn says it read, else the last view that was really written
+    const kind = t.ch, seen = read || writtenAsOf[kind] || 0, who = turnWho(t), label = turnLabel(t);
+    const run = new Run({ prefix: "turn:" + t.id + ":", commit: true, by: "claude", who: label });
+    liveState.turn = { who: label, what: "working…", run }; renderLiveChip();
+    const len = text.length, step = Math.max(48, Math.ceil(len / 60)); // at most about 2.5 s, so a turn never keeps anyone waiting
+    let i = 0, lastAt = null, done = false;
+    const fail = e => { if (done) return; done = true; activeTurnFlush = null; console.error(e); try { run.end(); } catch (x) {} liveState.turn = null; renderLiveChip(); sharePatch({ claude: null }); Store.finishTurn(t, { at: Date.now(), by: Store.tab, ok: false, results: run.results.map(r => (r.ok ? "" : "✗ ") + r.text).concat(["✗ the turn stopped: " + ((e && e.message) || e)]), errors: [] }); resolve(); };
+    activeTurnFlush = () => { if (done) return; i = len; try { tickNow(); } catch (e) { fail(e); } };
+    const tick = () => { try { tickNow(); } catch (e) { fail(e); } };
+    const tickNow = () => {
+      if (done) return;
+      if (document.hidden) i = len; else i = Math.min(len, i + step);
+      // never pause inside a header line: it would draw a half-named draft
+      const ls = text.lastIndexOf("\n", i - 1) + 1; if (i < len && text.startsWith("@@", ls)) { const e = text.indexOf("\n", i); i = e < 0 ? len : e; }
+      Store.as(who, () => run.update(text.slice(0, i), i >= len)); // what lands is this Claude's: its person's id goes with every change
+      const cur = run.current; liveState.turn.what = describeCurrent(run, "working…"); renderLiveChip();
+      if (cur && cur.slot) {
+        desk.claudeAt(cur.slot.x + 14, cur.slot.y - 28, cur.name);
+        // everyone else sees this Claude at work, where it is
+        const at = [Math.round(cur.slot.x + 14), Math.round(cur.slot.y - 28)]; if (!lastAt || lastAt[0] !== at[0] || lastAt[1] !== at[1]) { lastAt = at; sharePatch({ claude: { at, what: cleanStr(liveState.turn.what, 120), agent: t.agent ? cleanStr(t.agent, 40) : null, desk: Store.deskId } }); }
+      }
+      if (i < len) { setTimeout(tick, 40); return; }
+      done = true; activeTurnFlush = null;
+      run.end(); liveState.turn = null; renderLiveChip(); sharePatch({ claude: null });
+      const results = run.results, failed = run.failedApps;
+      if (run.prose) sayClaude(run.prose, label);
+      Store.as(who, () => Store.log("chat", run.prose || `(${results.length} change${results.length === 1 ? "" : "s"} on the desktop)`, null, "claude"));
+      const last = [...results].reverse().find(r => r.ok && r.id); if (last && !results.some(r => /^Opened /.test(r.text))) setTimeout(() => desk.spotlight(last.id, false), 80);
+      if (failed.length) toast(`${failed.map(f => `“${f.name}”`).join(", ")} did not build. Claude sees why on its next turn.`);
+      Store.finishTurn(t, { at: Date.now(), by: Store.tab, ok: results.every(r => r.ok), results: results.map(r => (r.ok ? "" : "✗ ") + r.text).slice(0, 60), errors: failed.map(f => ({ app: f.name, errors: f.errors.slice(0, 6).map(e => `line ${e.line}: ${e.message}${e.hint ? " (" + e.hint + ")" : ""}`) })) });
+      Store.setCursor(seen, kind);
+      scheduleView(0);
+      resolve();
+    };
+    tick();
+  });
+}
+/* what Claude says lands on the desktop too, not only in the chat */
+let sayT = null;
+function sayClaude(text, who) {
+  addMsg("claude", text, null, who);
+  if (!$("thread").hidden) return; // the open thread already shows it
+  const box = $("claude-say"); box.querySelector(".eye").textContent = who || "Claude"; box.querySelector(".txt").textContent = text; box.hidden = false;
+  clearTimeout(sayT); sayT = setTimeout(() => (box.hidden = true), Math.min(30000, Math.max(6000, 3000 + text.length * 45)));
+}
+$("claude-say").querySelector(".x").addEventListener("click", () => { $("claude-say").hidden = true; clearTimeout(sayT); });
+/* a turn this view may not apply (or that another tab holds) waits; say so */
+function renderPending() {
+  const waiting = Store.mode === "db" ? Store.turns.filter(t => playable(t) && !t.applied && t.text !== null).length : 0;
+  if (liveState.turn && liveState.turn.run) return;
+  liveState.turn = waiting && !turnBusy ? { who: "Claude", what: `${waiting} turn${waiting > 1 ? "s" : ""} waiting to land` } : null;
+  renderLiveChip();
+}
+
+/* ---------- the view: what each Claude in a chat reads, kept current by its person's page ---------- */
+const VIEW_LIMIT = 90000; // characters of file content per view, so a read stays small
+/* a person as a Claude reads them: a name (this viewer resolves it), never an id */
+const pname = id => { const p = Store.person(id); return p && p.name ? p.name : p && p.guest ? "a guest" : "someone"; };
+/* who did something, said to the Claude of `kind`'s channel: "you" is that Claude */
+function viewWho(by, who, kind) {
+  const mine = kind === "mine" ? Store.me.id : null;
+  if (by === "claude") return (who || null) === mine ? "you" : who ? `${pname(who)}’s Claude` : "Claude (shared channel)";
+  if (by === "agent") return who ? `${pname(who)}’s canvas Claude` : "the canvas Claude";
+  return who ? pname(who) : Store.me.isOwner || !Store.me.id ? "your person" : "the owner";
+}
+/* what each person did in a built-in app, as Claude reads it */
+function kitPeople(df, kind) { const sc = df && Store.markScope("f", df.id); return sc ? Store.marksFor(sc).map(m => ({ id: m.id, name: viewWho("you", m.id, kind), v: m.v })) : []; }
+function kitState(app, kind) { const K = T.KITS[app.kit], df = Store.byName(app.name + " · data", "data"); return K && df ? K.state(df.content || {}, kitPeople(df, kind)) : ""; }
+function fileHead(f, kind) {
+  const by = viewWho(f.by, f.who, kind || chanKind()), last = f.eby && (f.eby !== f.by || (f.ewho || null) !== (f.who || null)) ? ` · last changed by ${viewWho(f.eby, f.ewho, kind || chanKind())}` : "";
+  if (f.kit && f.type === "app" && T.KITS[f.kit]) return `@@${f.kit} ${f.name} (id ${f.id} · by ${by} · ${f.placed ? `at ${Math.round(f.x)},${Math.round(f.y)}` : "tucked away"} · ${kitState(f, kind)})`;
+  const where = f.type === "note" ? (f.placed ? `at ${Math.round(f.x)},${Math.round(f.y)}` : desk.owner.has(f.id) ? "in an app" : "in the Inbox") : f.placed ? `at ${Math.round(f.x)},${Math.round(f.y)}${f.w ? ` ${Math.round(f.w)}×${Math.round(f.h || 0)}` : ""}` : "tucked away";
+  const size = f.type === "note" ? "" : ` · ${String(T.encodeBody(f.type, f.content)).length} chars`;
+  const label = f.type === "note" ? `${f.kind || "note"} ${String(f.content).split("\n")[0].slice(0, 80)}` : f.name;
+  return `@@${f.type} ${label}${(f.tags || []).map(x => " #" + x).join("")} (id ${f.id} · by ${by}${last} · ${where}${size}${f.done ? " · done" : ""}${f.status ? " · " + f.status : ""})`;
+}
+function consoleTail(f, kind) {
+  if (f.type !== "program" || !(f.output || []).length) return "";
+  return `console of “${f.name}” (${f.status || "idle"}${f.ranBy ? ", ran by " + viewWho(f.ranBy, f.ranWho, kind || chanKind()) : ""}):\n` + f.output.slice(-14).map(l => `  ${l.kind === "error" ? "✗ " : l.kind === "result" ? "" : ""}${String(l.text).slice(0, 240)}`).join("\n");
+}
+function appErrors() {
+  const out = [];
+  for (const f of Store.list()) {
+    if (f.type !== "app" || !f.placed) continue;
+    const a = desk.apps.get(f.id); if (!a) continue;
+    const errs = (a.compiled && a.compiled.errors.length ? a.compiled.errors.map(e => e.toJSON()) : []).concat(a.view ? [...a.view.errors.values()] : []);
+    if (errs.length) out.push(`App “${f.name}”: ` + errs.slice(0, 4).map(e => `line ${e.line}: ${e.message}`).join("; "));
+  }
+  return out;
+}
+/* where a person is, for a Claude: what they look at, have selected and are editing */
+function placeOf(pr) {
+  const f = id => { const g = id && Store.files.get(id); return g ? `${T.TYPE_LABEL[g.type] ? T.TYPE_LABEL[g.type].toLowerCase() : g.type} “${g.type === "note" ? String(g.content).slice(0, 50) : g.name}”` : null; };
+  const sel = pr.selected && f(pr.selected.id), ed = f(pr.editing);
+  return [pr.view ? `looking at ${Math.round(pr.view[0] / 20) * 20},${Math.round(pr.view[1] / 20) * 20}` : null, sel ? `selected ${sel}` : null, ed ? `typing in ${ed}` : null].filter(Boolean).join(" · ");
+}
+function buildView(kind) {
+  kind = kind || chanKind();
+  const cur = kind === "mine" ? Store.myCursor : Store.shared.cursor, mine = kind === "mine" ? Store.me.id : null;
+  const since = (cur && cur.at) || 0, files = Store.list(), deskId = Store.deskId, next = nextTurn(kind);
+  const byThisClaude = (by, who) => by === "claude" && (who || null) === mine;
+  const evs = Store.events.filter(e => e.at > since && !byThisClaude(e.by, e.who)).slice(0, 80).reverse();
+  // files someone other than this Claude changed since it last read; everything on a first read
+  const changed = files.filter(f => (f.updated || f.at || 0) > since && (f.eby ? !byThisClaude(f.eby, f.ewho) : !f.fresh)).sort((a, b) => (b.updated || 0) - (a.updated || 0));
+  let left = VIEW_LIMIT; const blocks = [];
+  for (let k = 0; k < changed.length; k++) {
+    const f = changed[k];
+    if (f.kit && f.type === "app") continue; // its content shows through its data
+    const body = clip(T.encodeBody(f.type, f.content), f.type === "note" ? 600 : 6000);
+    const b = f.kit && f.type === "data" && T.KITS[f.kit] ? `@@${f.kit} ${f.name.replace(/ · data$/, "")}${T.kitVariant(f.kit, f.content) ? " · " + T.kitVariant(f.kit, f.content) : ""} (id ${f.id} · data)\n${clip(T.KITS[f.kit].encode(f.content || {}), 6000)}\n@@end\nstate: ${T.KITS[f.kit].state(f.content || {}, kitPeople(f, kind))}` : (f.type === "note" ? `@@note ${f.kind || "note"}${(f.tags || []).map(x => " #" + x).join("")} (id ${f.id} · by ${viewWho(f.by, f.who, kind)})\n${body}\n@@end` : `${fileHead(f, kind)}\n${body}\n@@end`) + (f.type === "program" ? "\n" + consoleTail(f, kind) : "");
+    if (left - b.length < 0) { blocks.push(`(${changed.length - k} more changed files are not shown here: read one with ArtifactData get, collection "desks/${deskId}/files", doc_id its id)`); break; }
+    left -= b.length; blocks.push(b);
+  }
+  const running = files.filter(f => f.type === "program" && f.status === "running" && !changed.includes(f)).map(f => consoleTail(f, kind)).filter(Boolean);
+  const sel = desk.sel && Store.files.get(desk.sel), c = desk.viewCenter();
+  const own = Store.turns.filter(t => t.ch === kind), lastT = [...own].reverse().find(t => t.applied);
+  const pending = own.filter(t => !t.applied && t.text !== null).map(t => t.id);
+  viewAsOf[kind] = Math.max(since, Store.events.length ? Store.events[0].at : 0);
+  const read = kind === "mine" ? `ArtifactData get, collection "data/users/me", doc_id "claude-${deskId}"` : `ArtifactData get, collection "claude", doc_id "${deskId}"`;
+  const write = kind === "mine" ? `ArtifactData set, collection "data/users/me/claude-${deskId}/turns", doc_id "${next}"` : `ArtifactData set, collection "claude/${deskId}/turns", doc_id "${next}"`;
+  // who else is here now, and where (people on another desktop of this computer are counted, not placed)
+  const here = peopleNow().filter(p => !p.isMe), away = (Store.peopleIds || []).filter(id => id !== Store.me.id && !here.some(p => p.id === id)).length;
+  const people = here.map(p => `${p.name || "someone"}${p.guest ? " (guest)" : ""}: ${placeOf(p) || "here"}${p.claude ? ` · their Claude is ${p.claude.what || "working"}` : ""}`);
+  return {
+    asOf: viewAsOf[kind],
+    next,
+    how: `Read this view: ${read}. Write your turn: ${write}, data { "text": "<block format>" }. Blocks: @@note @@doc @@list @@table @@data @@link @@page @@program @@app @@append @@delete @@run @@open @@tuck @@move and the built-in apps (@@poll @@quiz @@form …). Text outside blocks shows on the desktop as you speaking. Answer with apps and files, not with long chat replies. ${kind === "mine" ? "This channel is yours: only the person you work for, and you, can read it; everyone on the desktop sees what you make, as their Claude." : "This is the shared channel: any editor's Claude may use it."}`,
+    channel: kind,
+    desk: { id: deskId, title: Store.desk().title || "My desktop", files: files.length },
+    you: kind === "mine" ? { workFor: pname(Store.me.id), guest: false } : undefined,
+    person: kind === "mine" || !Store.me.id ? { name: Store.me.id ? pname(Store.me.id) : undefined, looking: [Math.round(c.x / 20) * 20, Math.round(c.y / 20) * 20], zoom: Math.round(desk.cam.z * 10) / 10, selected: sel ? `${sel.type} “${sel.type === "note" ? String(sel.content).slice(0, 60) : sel.name}” (id ${sel.id})` : null } : undefined,
+    people: people.length || away ? (people.length ? people.join("\n") : "(nobody else is here right now)") + (away ? `\n(${away} other ${away === 1 ? "person has" : "people have"} been on this computer)` : "") : undefined,
+    changes: evs.length ? evs.map(e => `${new Date(e.at).toTimeString().slice(0, 5)} · ${viewWho(e.by, e.who, kind)} · ${e.op === "act" ? "" : e.op + ": "}${String(e.text).slice(0, 160)}`).join("\n") : since ? "(nothing since your last turn)" : "(a new desktop)",
+    changed: blocks.join("\n\n") || "(no file changed since your last turn)",
+    running: running.join("\n\n") || undefined,
+    files: files.filter(f => !(f.kit && f.type === "data")).map(f => fileHead(f, kind)).join("\n") || "(the desktop is empty)",
+    errors: appErrors().join("\n") || undefined,
+    last: lastT ? Object.assign({ turn: lastT.id }, lastT.applied) : undefined,
+    pending: pending.length ? pending : undefined,
+    issue: Store.turnIssue || undefined, // what went wrong playing a turn, if anything
+    live: `room ${liveStatus.room}${liveStatus.connected === false ? " (disconnected)" : ""}, ${peers.length} other open page${peers.length === 1 ? "" : "s"} (${peers.filter(p => p.isMe).length} of them yours), identity ${Store.me.id ? "known" : "unknown"}`,
+    writeErrors: (Store.writeIssues || []).length ? Store.writeIssues.map(w => `${new Date(w.at).toTimeString().slice(0, 8)} ${w.path}: ${w.code || ""} ${w.message}${w.quiet ? " (quiet)" : ""}`) : undefined,
+  };
+}
+let viewT = null; const lastViewKey = { mine: "", shared: "" };
+/* at most one view write per 900 ms while things keep changing (a moving pointer must never starve it); 0 writes at once */
+function scheduleView(ms) {
+  if (Store.mode !== "db") return;
+  if (ms === 0) { clearTimeout(viewT); viewT = setTimeout(() => { viewT = null; writeView(); }, 0); return; }
+  if (viewT) return; viewT = setTimeout(() => { viewT = null; writeView(); }, ms == null ? 900 : ms);
+}
+/* a view is one document: it must stay well under 256 KiB, in bytes, whatever the desktop holds */
+const VIEW_BYTES = 200000, bytesOf = o => new TextEncoder().encode(JSON.stringify(o)).length;
+function fitView(v) {
+  const cut = (k, keep) => { if (typeof v[k] !== "string") return false; const lines = v[k].split("\n"); if (lines.length <= 4) { v[k] = v[k].slice(0, Math.floor(v[k].length * keep)); return true; } v[k] = lines.slice(0, Math.max(3, Math.floor(lines.length * keep))).join("\n") + `\n(… cut to fit: read files one by one with ArtifactData get, collection "desks/${Store.deskId}/files")`; return true; };
+  for (let i = 0; i < 12 && bytesOf(v) > VIEW_BYTES; i++) cut(i < 6 ? "changed" : i < 10 ? "files" : "changes", 0.6);
+  return v;
+}
+/* the shared view has one writer at a time: the editor's page that holds its lease */
+let sharedWriter = { until: 0 };
+async function holdSharedView() {
+  if (Date.now() < sharedWriter.until - 5000) return true;
+  try { const r = await Store.db.doc("claude/" + Store.deskId + "-writer").acquire({ holder: Store.tab, ttlMs: 30000 }); if (r && r.acquired) { sharedWriter.until = Date.now() + 30000; return true; } } catch (e) {}
+  return false;
+}
+/* my Claude's view (private), and on an editor's page the shared one too */
+async function writeView() {
+  if (Store.mode !== "db" || !Store.ready) return;
+  for (const kind of ["mine", "shared"]) {
+    if (kind === "mine" && !Store.me.id) continue;
+    if (kind === "shared" && (Store.me.canEdit === false || !(await holdSharedView()))) continue;
+    let v; try { v = buildView(kind); } catch (e) { console.warn("view", e); continue; }
+    if (kind === "shared") { delete v.live; delete v.writeErrors; delete v.issue; } // what only this page knows stays out of the shared view
+    fitView(v);
+    const key = JSON.stringify(Object.assign({}, v, { asOf: 0 })); if (key === lastViewKey[kind]) continue;
+    lastViewKey[kind] = key; const asOf = v.asOf;
+    Store.writeView(v, kind).then(ok => { if (ok) writtenAsOf[kind] = Math.max(writtenAsOf[kind], asOf); else lastViewKey[kind] = ""; });
+  }
+}
+
+/* ---------- the canvas agent ---------- */
+const chat = { msgs: [], abort: null, n: 0 };
+function addMsg(role, text, chips, who) {
+  if (role !== "claude") $("thread").hidden = false; // Claude in the chat speaks on the desktop; its lines are kept here quietly
+  const li = el("li", { class: "msg " + role }, el("div", { class: "who" }, who || (role === "you" ? "You" : role === "agent" ? "Claude · canvas" : role === "claude" ? "Claude · chat" : "Desktop")), el("div", { class: "body" }, text || ""));
+  if (chips && chips.length) li.append(el("div", { class: "chips" }, ...chips));
+  $("messages").appendChild(li); $("messages").scrollTop = 1e9; emit("message", { role, text });
+  return li;
+}
+const chip = (t, cls, id) => id ? el("button", { type: "button", class: "chip " + (cls || ""), onclick: () => desk.openFile(id) }, t) : el("span", { class: "chip " + (cls || "") }, t);
+async function ask(request, opts) {
+  request = String(request || "").trim(); if (!request) return { ok: false, error: "Empty request." };
+  opts = opts || {};
+  if (!opts.repair && $("ask-btn").disabled) return { ok: false, error: "Claude is already answering." };
+  if (!opts.repair) { addMsg("you", request); chat.msgs.push({ role: "you", text: request }); Store.log("chat", request, null, "you"); }
+  const li = addMsg("agent", "Thinking…"), body = li.querySelector(".body");
+  $("stop").hidden = false; $("ask-btn").disabled = true; chat.abort = new AbortController();
+  const user = opts.repair || contextFor(request, chat.msgs.slice(-12, -1));
+  const newRun = () => new Run({ prefix: "ask" + (++chat.n) + ":", commit: true, by: "agent", who: "Claude · canvas" });
+  let run = newRun();
+  liveState.canvas = { who: "Claude · canvas", what: "thinking…", run }; renderLiveChip();
+  let res;
+  try {
+    res = await complete(SYSTEM(), user, text => {
+      run.update(text, false);
+      body.textContent = run.prose || "Working…";
+      liveState.canvas.what = describeCurrent(run, run.results.length ? "finishing…" : "thinking…"); renderLiveChip();
+      $("messages").scrollTop = 1e9;
+    }, chat.abort.signal, msg => {
+      // the next model starts its answer from the top: drop the drafts of the one that failed
+      addMsg("sys", msg); run.end(); run = newRun(); liveState.canvas.run = run;
+    });
+  } catch (e) {
+    run.end(); liveState.canvas = null; renderLiveChip();
+    $("stop").hidden = true; $("ask-btn").disabled = false;
+    const stopped = e && (e.name === "AbortError" || e.code === "cancelled");
+    body.textContent = (run.prose ? run.prose + "\n\n" : "") + (stopped ? "Stopped." : `No model answered: ${(e && e.message) || e}`);
+    if (run.results.length) li.append(el("div", { class: "chips" }, ...run.results.map(r => chip(r.text, r.ok ? "ok" : "bad", r.ok && r.id))));
+    renderModel(); return { ok: false, error: (e && e.message) || String(e), results: run.results };
+  }
+  run.update(res.text, !res.truncated); run.end();
+  liveState.canvas = null; renderLiveChip();
+  if (res.truncated) addMsg("sys", "The answer was cut short; the last block it was writing was not kept.");
+  $("stop").hidden = true; $("ask-btn").disabled = false;
+  body.textContent = run.prose || (run.results.length ? "Done." : res.text.trim().slice(0, 600) || "Done.");
+  const chips = [chip(res.label)].concat(run.results.filter(r => !r.app).map(r => chip(r.text, r.ok ? "ok" : "bad", r.ok && r.id)));
+  const out = { ok: true, model: res.label, results: run.results };
+  const failed = run.failedApps;
+  if (failed.length && !opts.repair) {
+    chips.push(chip(`${failed.length} app${failed.length > 1 ? "s" : ""} failed to build · repairing`, "bad"));
+    li.append(el("div", { class: "chips" }, ...chips));
+    const again = contextFor(request, []) + "\n\nYour previous answer:\n" + clip(res.text, 20000) + "\n\nThese apps fail to build:\n" + failed.map(f => `App “${f.name}”:\n` + f.errors.map(e => `- line ${e.line}: ${e.message} ${e.hint || ""}`).join("\n")).join("\n") + "\nAnswer with one short sentence and the corrected @@app blocks only, complete.";
+    return ask(request, { repair: again });
+  }
+  for (const f of failed) chips.push(chip(`“${f.name}”: line ${f.errors[0].line}: ${f.errors[0].message}`, "bad"));
+  li.append(el("div", { class: "chips" }, ...chips));
+  chat.msgs.push({ role: "agent", text: run.prose }); Store.log("chat", run.prose || "(changed the desktop)", null, "agent");
+  return out;
+}
+$("stop").addEventListener("click", () => chat.abort && chat.abort.abort());
+
+/* ==========================================================================
+   HAND-OFFS · to Claude in the chat, which this page can never wake by
+   itself. Presence says what you are looking at (the platform may hand it to
+   the conversation beside the page). Send to Claude stages a file, or a
+   digest of what changed, in your message box: it reaches Claude when you
+   press Enter. The cursor says how far chat-Claude has read the log.
+   ========================================================================== */
+let room = null, sendState = "off", downloads = null;
+// the platform refuses a whole hand-off over one control, format or private-use character: strip them all, and never split a character
+const cleanStr = (v, n) => Array.from(String(v ?? "").replace(/[\p{Cc}\p{Cf}\p{Co}]/gu, c => "\t\n\r".includes(c) ? c : "")).slice(0, n || 400).join("");
+/* any value an app hands over, made to fit the platform: identifier keys, at most 64 per level, 8 deep */
+function cleanJson(v, depth) {
+  depth = depth || 0;
+  if (v == null || typeof v === "number" || typeof v === "boolean") return v ?? null;
+  if (typeof v === "string") return cleanStr(v, 1000);
+  if (depth > 5) return cleanStr(JSON.stringify(v), 400);
+  if (Array.isArray(v)) return v.slice(0, 64).map(x => cleanJson(x, depth + 1));
+  if (typeof v === "object") { const o = {}; for (const [k, x] of Object.entries(v).slice(0, 64)) { const key = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(k) && !(k in Object.prototype) ? k : "k_" + cleanStr(k, 40).replace(/[^A-Za-z0-9_-]/g, "_"); o[key] = cleanJson(x, depth + 1); } return o; }
+  return cleanStr(String(v), 400);
+}
+const bytes = o => new TextEncoder().encode(JSON.stringify(o)).length;
+function fitPayload(o) { // the platform takes at most 4 KiB of JSON
+  for (let i = 0; i < 16 && bytes(o) > 3800; i++) {
+    if (o.content && o.content.length > 160) o.content = Array.from(o.content).slice(0, Math.floor(o.content.length * 0.65)).join("") + " …";
+    else if (o.events && o.events.length > 2) o.events = o.events.slice(0, Math.ceil(o.events.length * 0.65));
+    else if (o.data !== undefined && JSON.stringify(o.data).length > 60) { const j = typeof o.data === "string" ? o.data : JSON.stringify(o.data); o.data = Array.from(j).slice(0, Math.floor(j.length * 0.6)).join("") + " …(cut; the full state is on the desktop)"; }
+    else if (o.say && o.say.length > 120) o.say = Array.from(o.say).slice(0, Math.floor(o.say.length * 0.6)).join("") + " …";
+    else break;
+  }
+  return o;
+}
+/* every hand-off says where its Claude reads and where it answers, so a turn needs no lookup
+   (ArtifactData paths: in data/users/me, "me" is whoever's Claude reads it) */
+const replyTo = () => { const c = Store.channel(); return { read: c.artifactView.collection + "/" + c.artifactView.doc_id, write: c.artifactTurns + "/" + nextTurn(c.kind) }; };
+function payloadForFile(f) {
+  return fitPayload({ label: cleanStr(`${T.TYPE_LABEL[f.type] || "File"} “${f.type === "note" ? String(f.content).slice(0, 40) : f.name}”`, 110), what: "file", desk: Store.deskId, id: f.id, name: cleanStr(f.name, 120), type: f.type, by: cleanStr(viewWho(f.by, f.who, chanKind()), 60), reply: replyTo(), content: cleanStr(f.type === "note" ? f.content : T.encodeBody(f.type, f.content), 3000) });
+}
+/* what this page's Claude has not read yet: everyone's changes but its own */
+const unreadForClaude = () => { const since = (Store.cursor && Store.cursor.at) || 0, mine = chanKind() === "mine" ? Store.me.id : null; return Store.events.filter(e => e.at > since && !(e.by === "claude" && (e.who || null) === mine)); };
+function payloadDigest() {
+  const evs = unreadForClaude(), kind = chanKind();
+  return fitPayload({ label: `${evs.length} change${evs.length === 1 ? "" : "s"} on the desktop`, what: "digest", desk: Store.deskId, reply: replyTo(), since: (Store.cursor && Store.cursor.at) || 0, events: evs.slice(0, 40).map(e => ({ at: e.at, who: cleanStr(viewWho(e.by, e.who, kind), 40), op: e.op, text: cleanStr(e.text, 140), ref: e.ref || null })) });
+}
+const canSend = () => ["available", "available_if_summoned", "available_if_opened"].includes(sendState);
+function handToClaude(payload, what, opts) {
+  // runs synchronously inside the click: the platform proves the gesture from this very call
+  if (room && canSend()) {
+    const send = ((opts && opts.deliver === "send") || sendState === "available_if_summoned") && sendState !== "available_if_opened";
+    if (sendState === "available_if_opened") local.set("draft", prompt.value); // the browser may leave this page for the chat
+    let p; try { p = room.sendToClaudeSession(payload, send ? { deliver: "send" } : undefined); } catch (e) { p = Promise.reject(e); }
+    p.then(r => toast(send ? (r && r.to === "pane" ? `${what} went to Claude. It answers here, on the desktop.` : `${what} is on its way to Claude.`) : r && r.to === "pane" ? `${what} is in your message to Claude. Add a word and send.` : `${what} is on its way to your chat with Claude.`),
+      e => e && e.code === "rate_limited" ? toast("Claude is getting a lot at once. Try again in a moment.") : copyForClaude(payload, what, e && e.code));
+    return true;
+  }
+  copyForClaude(payload, what); return false;
+}
+/* c.claude(say, data) in an app: the click becomes Claude's next turn, with what the app holds */
+function toClaudeFromApp(say, data, app) {
+  const payload = fitPayload({ label: cleanStr(`${app}: ${say || "your turn"}`, 110), what: "app", app: cleanStr(app, 120), desk: Store.deskId, say: cleanStr(say == null ? "" : typeof say === "string" ? say : JSON.stringify(say), 1200), data: data === undefined ? null : cleanJson(data), reply: replyTo() });
+  const sent = handToClaude(payload, say ? `“${cleanStr(say, 40)}”` : "Your answer", { deliver: "send" });
+  Store.log("chat", `→ Claude, from “${app}”: ${cleanStr(say || "", 200)}`, null, "you");
+  return sent;
+}
+async function copyForClaude(payload, what, code) {
+  const txt = "From my Claude Computer desktop:\n" + JSON.stringify(payload, null, 2);
+  try { await navigator.clipboard.writeText(txt); toast(`${what} is copied. Paste it into the chat with Claude.`); }
+  catch (e) { toast(code ? `Couldn't hand this to Claude here (${code}).` : "Handing things to Claude isn't available in this view."); }
+}
+async function refreshSendState() { if (!room) { sendState = "off"; return; } try { sendState = await room.canSendToClaudeSession(); } catch (e) { sendState = "off"; } renderUnread(); placeSelbar(true); }
+
+/* ==========================================================================
+   PEOPLE · everyone who has this computer open, live. Each open page keeps
+   itself in the room's presence: its person's id, the desktop and spot it
+   looks at, what it has selected or is typing in, its pointer, the window
+   it drags, and its person's Claude at work. Every page draws the others:
+   faces in the corner (click one to go there or follow), pointers with
+   names, selections and "typing" marks on windows, windows moving under
+   someone's hand, and each Claude's marker with whose Claude it is.
+   Nothing here is stored: presence is gone when the page closes.
+   ========================================================================== */
+let peers = [], following = null, presT = null;
+const presence = {}; // what this page last said about itself
+/* merge a patch into this page's presence (null removes a field); the room sends it coalesced */
+function sharePatch(patch) {
+  for (const [k, v] of Object.entries(patch)) { if (v === null || v === undefined) delete presence[k]; else presence[k] = v; }
+  if (room) room.presence(patch).catch(() => {});
+}
+function sharePresence() {
+  scheduleView();
+  clearTimeout(presT);
+  presT = setTimeout(() => {
+    const f = desk.sel && Store.files.get(desk.sel), c = desk.viewCenter();
+    sharePatch({ app: "claude-computer", who: Store.me.id || null, desk: Store.deskId, deskTitle: cleanStr(Store.desk().title, 80), selected: f ? { id: f.id, type: f.type, name: cleanStr(f.type === "note" ? String(f.content).slice(0, 80) : f.name, 120) } : null, view: [Math.round(c.x), Math.round(c.y)], zoom: Math.round(desk.cam.z * 100) / 100, files: Store.files.size });
+  }, 300);
+}
+/* my pointer on the desktop, in desktop units (each page draws it at its own zoom) */
+let ptrRaf = 0, ptrAt = null;
+$("stage").addEventListener("pointermove", e => { if (!room || e.pointerType === "touch") return; ptrAt = desk.toWorld(e.clientX, e.clientY); if (ptrRaf) return; ptrRaf = requestAnimationFrame(() => { ptrRaf = 0; if (ptrAt) sharePatch({ cursor: [Math.round(ptrAt.x), Math.round(ptrAt.y)] }); }); }, { passive: true });
+$("stage").addEventListener("pointerleave", () => { ptrAt = null; if (room && presence.cursor) sharePatch({ cursor: null }); });
+/* what I am typing in: others see "Ana is typing" on that window */
+const editingIn = t => { if (!t || !t.closest || !t.matches("textarea, input, select, [contenteditable], [contenteditable] *")) return null; const o = t.closest(".obj[data-id], [data-note]"); return o ? o.dataset.id || o.dataset.note : null; };
+document.addEventListener("focusin", e => { const id = editingIn(e.target); if ((presence.editing || null) !== id) { sharePatch({ editing: id }); } });
+document.addEventListener("focusout", () => setTimeout(() => { const id = editingIn(document.activeElement); if ((presence.editing || null) !== id) sharePatch({ editing: id }); }, 0));
+/* a peer's person: only the id the platform vouches for. What a page says about itself is never proof of who it is,
+   so a peer the platform does not name stays "Someone" (and can never wear another person's name or face) */
+const peerWho = p => whoOf(p.by) || null;
+const whoOf = x => typeof x === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(x) ? x : null;
+const peerColor = p => { const w = peerWho(p); return w ? (Store.person(w) || {}).color : ["#C15F3C", "#3F6E9A", "#6A7D3A", "#8A5A9C", "#B0872E", "#2F8577"][parseInt(T.fnv1a(p.peer).slice(0, 4), 16) % 6]; };
+const peerName = p => { if (p.isMe) return "You · other tab"; const w = peerWho(p), P = w ? Store.person(w) : null; return P && P.name ? P.name : (p.guest || (P && P.guest)) ? "A guest" : "Someone"; };
+/* everyone with this computer open, your own other tabs and devices included (this tab is left out in onPeers) */
+const live = p => p.kind === "viewer" && p.presence && p.presence.app === "claude-computer";
+const faceKey = p => p.isMe ? "me:" + p.peer : peerWho(p) || "peer:" + p.peer;
+let peopleCache = [], meCache = null;
+/** Everyone on this desktop now, me first: { id, name, color, avatar, guest, isMe, peer, view, zoom, selected, editing, claude } */
+function peopleNow() { return peopleCache; }
+function meNow() { if (meCache) return meCache; const P = Store.me.id ? Store.person(Store.me.id) : null; return (meCache = Object.freeze({ id: Store.me.id, name: (P && P.name) || "You", color: (P && P.color) || Store.me.color || null, avatar: (P && P.avatarUrl) || null, isMe: true, guest: false })); }
+function rebuildPeople() {
+  meCache = null;
+  const byPerson = new Map();
+  for (const p of peers) {
+    if (!live(p) || p.isMe || p.presence.desk !== Store.deskId) continue;
+    const id = peerWho(p), key = id || "peer:" + p.peer, prev = byPerson.get(key);
+    if (prev && prev.updatedAt >= p.updatedAt) continue;
+    const pr = p.presence, P = id ? Store.person(id) : null;
+    byPerson.set(key, { id, name: peerName(p), color: peerColor(p), avatar: P ? P.avatarUrl : null, guest: !!(p.guest || (P && P.guest)), isMe: false, peer: p.peer, view: Array.isArray(pr.view) ? pr.view : null, zoom: pr.zoom || null, selected: pr.selected && pr.selected.id ? { id: pr.selected.id, name: pr.selected.name || "" } : null, editing: pr.editing || null, claude: pr.claude && pr.claude.desk === Store.deskId ? { what: pr.claude.what || "", agent: pr.claude.agent || null } : null, updatedAt: p.updatedAt });
+  }
+  const me = meNow();
+  peopleCache = Object.freeze([Object.freeze({ id: me.id, name: me.name, color: me.color, avatar: me.avatar, guest: false, isMe: true, peer: null })].concat([...byPerson.values()].map(x => Object.freeze(x))));
+}
+/* the room changed: redraw faces, pointers, marks and Claude markers */
+let peersSig = "", marksSig = "";
+function onPeers(change) {
+  peers = change.peers.filter(p => !(p.isMe && p.sameTab));
+  rebuildPeople(); drawPeople();
+  const s = peopleCache.map(p => [p.id, p.peer, p.selected && p.selected.id, p.editing, p.claude && p.claude.what].join(":")).join("|");
+  if (s !== peersSig) { peersSig = s; scheduleView(); emit("people", peopleCache); }
+  if (following) followTick();
+}
+const remoteDragging = new Set();
+function drawPeople() {
+  const here = peers.filter(p => live(p) && p.presence.desk === Store.deskId), now = Date.now();
+  // pointers: one per open page, faded when it has not moved for a while
+  const layer = $("world"), seen = new Set();
+  for (const p of here) {
+    const c = p.presence.cursor; if (!Array.isArray(c) || !isFinite(Number(c[0])) || !isFinite(Number(c[1])) || now - p.updatedAt > 60000) continue;
+    seen.add(p.peer);
+    let e = layer.querySelector(`.peer-cursor[data-peer="${CSS.escape(p.peer)}"]`);
+    if (!e) { e = el("div", { class: "peer-cursor", "data-peer": p.peer, "aria-hidden": "true" }, svgPointer(), el("span", { class: "pc-name" })); layer.append(e); }
+    e.style.setProperty("--pc", peerColor(p)); e.style.setProperty("--x", Math.round(Number(c[0])) + "px"); e.style.setProperty("--y", Math.round(Number(c[1])) + "px");
+    const n = e.querySelector(".pc-name"), nm = peerName(p) + (p.presence.editing ? " · typing" : ""); if (n.textContent !== nm) n.textContent = nm;
+    e.classList.toggle("idle", now - p.updatedAt > 20000);
+  }
+  layer.querySelectorAll(".peer-cursor").forEach(e => { if (!seen.has(e.dataset.peer)) e.remove(); });
+  // windows someone is dragging follow their hand
+  const dragging = new Set();
+  const nn = v => typeof v === "number" && isFinite(v) ? v : undefined;
+  for (const p of here) { const d = p.presence.drag; if (d && typeof d.id === "string" && d.desk === Store.deskId && nn(d.x) !== undefined && nn(d.y) !== undefined && Store.files.has(d.id)) { dragging.add(d.id); desk.remoteMove(d.id, { x: d.x, y: d.y, w: nn(d.w), h: nn(d.h) }); } }
+  for (const id of remoteDragging) if (!dragging.has(id)) desk.remoteMove(id, null);
+  remoteDragging.clear(); dragging.forEach(id => remoteDragging.add(id));
+  // other Claudes at work: a marker with whose Claude it is
+  const cseen = new Set();
+  for (const p of here) {
+    const c = p.presence.claude; if (!c || c.desk !== Store.deskId || !Array.isArray(c.at) || !isFinite(Number(c.at[0])) || !isFinite(Number(c.at[1]))) continue;
+    cseen.add(p.peer);
+    let e = layer.querySelector(`.claude-cursor.peer[data-peer="${CSS.escape(p.peer)}"]`);
+    if (!e) { e = el("div", { class: "claude-cursor peer on", "data-peer": p.peer, "aria-hidden": "true" }, el("i"), el("span", { class: "cc-who" }), el("span", { class: "cc-what" })); layer.append(e); }
+    const w = peerWho(p), who = p.isMe ? "Your Claude · other tab" : w ? Store.label("claude", w) : "Someone’s Claude";
+    e.querySelector(".cc-who").textContent = who + (c.agent ? " · " + c.agent : ""); e.querySelector(".cc-what").textContent = c.what ? " · " + String(c.what).slice(0, 120) : "";
+    e.style.transform = `translate(${Math.round(Number(c.at[0]))}px, ${Math.round(Number(c.at[1]))}px)`;
+  }
+  layer.querySelectorAll(".claude-cursor.peer").forEach(e => { if (!cseen.has(e.dataset.peer)) e.remove(); });
+  drawMarks(here);
+  drawFaces();
+}
+/* who has what selected, and who is typing where: a colored outline and a small tag of faces on the window */
+function drawMarks(here) {
+  const on = new Map();
+  for (const p of here) {
+    const id = faceKey(p), sel = p.presence.selected && p.presence.selected.id, ed = p.presence.editing;
+    for (const [fid, how] of [[sel, "sel"], [ed, "edit"]]) { if (!fid) continue; if (!on.has(fid)) on.set(fid, new Map()); const m = on.get(fid); if (!m.has(id) || how === "edit") m.set(id, { p, how }); }
+  }
+  const sig = [...on.entries()].map(([fid, m]) => fid + "=" + [...m.entries()].map(([id, x]) => id + x.how + peerName(x.p)).join(",")).join("|") + "#" + desk.objs.size + ":" + (Store.peopleV || 0);
+  if (sig === marksSig) return; marksSig = sig;
+  document.querySelectorAll(".peer-sel, .peer-edit").forEach(e => { e.classList.remove("peer-sel", "peer-edit"); e.style.removeProperty("--pc"); });
+  document.querySelectorAll(".peer-tags").forEach(e => e.remove());
+  for (const [fid, m] of on) {
+    const e = desk.elFor(fid); if (!e) continue;
+    const list = [...m.values()], first = list[0], typing = list.filter(x => x.how === "edit");
+    e.classList.add(typing.length ? "peer-edit" : "peer-sel"); e.style.setProperty("--pc", peerColor((typing[0] || first).p));
+    const tag = el("div", { class: "peer-tags", "aria-hidden": "true" }, ...list.slice(0, 3).map(x => el("span", { class: "peer-tag", style: `--pc:${peerColor(x.p)}` }, peerName(x.p) + (x.how === "edit" ? " is typing" : ""))), list.length > 3 ? el("span", { class: "peer-tag more" }, "+" + (list.length - 3)) : null);
+    e.append(tag);
+  }
+}
+/* a redraw of the desktop replaces note cards: put the marks back */
+function peopleAfterSync() { marksSig = ""; if (peers.length) drawMarks(peers.filter(p => live(p) && p.presence.desk === Store.deskId)); }
+const svgPointer = () => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg"); s.setAttribute("viewBox", "0 0 16 16"); s.setAttribute("width", "16"); s.setAttribute("height", "16"); s.innerHTML = '<path d="M2 1.5 L13.5 8.2 L8.2 9.1 L5.6 14 Z" fill="var(--pc)" stroke="#fff" stroke-width="1.2" stroke-linejoin="round"/>'; return s; };
+/* the faces in the corner: who else has this computer open; click one to go where they are, or follow them */
+let facesSig = "";
+function drawFaces() {
+  const box = $("people"); if (!box) return;
+  const all = new Map();
+  for (const p of peers) { if (!live(p)) continue; const id = faceKey(p), prev = all.get(id); if (!prev || prev.updatedAt < p.updatedAt) all.set(id, p); }
+  const list = [...all.values()].sort((a, b) => (a.presence.desk === Store.deskId ? 0 : 1) - (b.presence.desk === Store.deskId ? 0 : 1) || a.peer.localeCompare(b.peer));
+  const sig = list.map(p => [peerWho(p), p.peer, p.presence.desk, peerName(p), (Store.person(peerWho(p)) || {}).avatarUrl].join(":")).join("|") + "#" + (following || "");
+  if (sig === facesSig) return; facesSig = sig;
+  box.hidden = !list.length;
+  box.replaceChildren(...list.slice(0, 6).map(p => {
+    const w = peerWho(p), away = p.presence.desk !== Store.deskId, nm = peerName(p);
+    const f = w && !p.isMe ? face(w, { title: nm }) : w ? face(w, { title: nm, cls: "me-other" }) : el("span", { class: "face", style: `--pc:${peerColor(p)}`, title: nm }, initials(nm));
+    const b = el("button", { type: "button", class: "pp" + (away ? " away" : "") + (following === p.peer ? " following" : ""), "aria-label": `${nm}${away ? `, on “${p.presence.deskTitle || "another desktop"}”` : ""}${following === p.peer ? ", following" : ""}`, "data-tip": away ? `${nm} · on “${p.presence.deskTitle || "another desktop"}”` : nm, style: `--pc:${peerColor(p)}` }, f);
+    b.addEventListener("click", () => { const r = b.getBoundingClientRect(); openMenu(personItems(p), r.right - 220, r.bottom + 6); });
+    return b;
+  }), ...(list.length > 6 ? [el("span", { class: "pp more", title: list.slice(6).map(peerName).join(", ") }, "+" + (list.length - 6))] : []));
+}
+function personItems(p) {
+  const nm = peerName(p), away = p.presence.desk !== Store.deskId, pr = p.presence;
+  const items = [el("div", { class: "menu-title" }, nm, p.guest ? el("small", null, " · guest") : null)];
+  if (p.isMe) items.push(el("p", { class: "menu-note" }, "This is you, in another tab or on another device."));
+  if (away) items.push(item(`Go to “${pr.deskTitle || "their desktop"}”`, () => { switchDesk(pr.desk); setTimeout(() => goTo(p.peer), 400); }));
+  else items.push(item(`Go to where ${nm.split(" ")[0]} is`, () => goTo(p.peer)));
+  items.push(following === p.peer ? item("Stop following", stopFollowing) : item(`Follow ${nm.split(" ")[0]}`, () => startFollowing(p.peer), "your view moves with theirs"));
+  if (pr.selected && pr.selected.id && Store.files.has(pr.selected.id)) items.push(item(`Open what they selected`, () => desk.openFile(pr.selected.id), cleanStr(pr.selected.name, 40)));
+  return items;
+}
+/* go to someone's view: the spot they look at, at their zoom */
+function goTo(peer, quick) {
+  const p = peers.find(x => x.peer === peer); if (!p) return false;
+  const pr = p.presence; if (pr.desk !== Store.deskId) { switchDesk(pr.desk); return true; }
+  if (!Array.isArray(pr.view) || !isFinite(Number(pr.view[0])) || !isFinite(Number(pr.view[1]))) return false;
+  const r = $("stage").getBoundingClientRect(), z = Math.max(0.12, Math.min(2.5, Number(pr.zoom) || desk.cam.z));
+  if (Math.abs(z - desk.cam.z) > 0.001) { const cx = desk.viewCenter(); desk.cam.z = z; desk.cam.x = cx.x - r.width / 2 / z; desk.cam.y = cx.y - r.height / 2 / z; desk.applyCam(); }
+  const to = { x: Number(pr.view[0]) - r.width / 2 / z, y: Number(pr.view[1]) - r.height / 2 / z };
+  if (quick || Math.hypot(to.x - desk.cam.x, to.y - desk.cam.y) < 2) { desk.cam.x = to.x; desk.cam.y = to.y; desk.applyCam(); }
+  else desk.camAnim = { t0: performance.now(), from: { x: desk.cam.x, y: desk.cam.y }, to };
+  return true;
+}
+function startFollowing(peer) { following = peer; sharePatch({ follow: { of: peer } }); goTo(peer); facesSig = ""; drawFaces(); renderFollow(); }
+function stopFollowing() { if (!following) return; following = null; sharePatch({ follow: null }); facesSig = ""; drawFaces(); renderFollow(); }
+let followView = "";
+function followTick() {
+  const p = peers.find(x => x.peer === following);
+  if (!p || !live(p)) { stopFollowing(); toast("They left, so you are no longer following."); return; }
+  const key = (p.presence.view || []).join(",") + ":" + p.presence.zoom + ":" + p.presence.desk; if (key === followView) return; followView = key;
+  goTo(following, false);
+}
+function renderFollow() {
+  const bar = $("followbar"); if (!bar) return;
+  const p = following && peers.find(x => x.peer === following);
+  bar.hidden = !p; if (!p) { document.body.style.removeProperty("--follow"); return; }
+  document.body.style.setProperty("--follow", peerColor(p));
+  bar.replaceChildren(el("span", null, `Following ${peerName(p)}`), el("button", { type: "button", class: "btn sm ghost", onclick: stopFollowing }, "Stop"));
+}
+function renderUnread() {
+  const b = $("for-claude"), n = Store.mode === "db" ? unreadForClaude().length : 0;
+  b.hidden = !n; if (!n) return;
+  b.textContent = `${n} new for Claude`;
+  b.title = canSend() ? "Put what changed into your message to Claude" : "Copy what changed, to paste into the chat with Claude";
+}
+$("for-claude").addEventListener("click", () => handToClaude(payloadDigest(), "What changed"));
+async function exportDesk() {
+  const data = JSON.stringify({ format: "claude-computer/desk@1", exported: Date.now(), desk: Object.assign({ id: Store.deskId }, Store.desk()), files: Store.list(), events: Store.events }, null, 2);
+  const name = (T.slug(Store.desk().title || "") || "desktop") + ".json";
+  if (downloads) { try { await downloads.save({ filename: name, data }); return; } catch (e) { if (e && e.code === "declined") return; } }
+  try { await navigator.clipboard.writeText(data); toast("The desktop is copied as JSON."); } catch (e) { toast("Export isn't available in this view."); }
+}
+
+/* ==========================================================================
+   DRAWER · Files, Log, Book
+   ========================================================================== */
+let drawerTab = "files";
+function openDrawer(tab) {
+  drawerTab = tab || drawerTab; $("drawer").hidden = false; $("drawer").classList.toggle("wide", drawerTab === "book");
+  document.querySelectorAll("#drawer .tab").forEach(t => t.setAttribute("aria-selected", String(t.dataset.tab === drawerTab)));
+  for (const k of ["files", "log", "book"]) $("panel-" + k).hidden = k !== drawerTab;
+  if (drawerTab === "files") renderFiles(); if (drawerTab === "log") renderLog(); if (drawerTab === "book" && !$("book").firstChild) renderChapter(chapter);
+}
+document.querySelectorAll("#drawer .tab").forEach(t => t.addEventListener("click", () => openDrawer(t.dataset.tab)));
+$("drawer-close").addEventListener("click", () => ($("drawer").hidden = true));
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("drawer").hidden && !e.target.closest("textarea, input, [contenteditable]")) $("drawer").hidden = true; });
+const GROUPS = [["app", "Apps"], ["program", "Programs"], ["page", "Pages"], ["doc", "Docs"], ["list", "Lists"], ["table", "Tables"], ["data", "Data"], ["link", "Links"], ["note", "Notes"]];
+function renderFiles() {
+  const q = $("files-search").value.trim().toLowerCase(), box = $("files-list"), all = Store.list();
+  $("files-count").textContent = all.length || "";
+  box.replaceChildren();
+  if (!all.length) { box.append(el("p", { class: "d-empty" }, "This desktop is empty. Capture a note in the bar below, right-click the desktop for a new file, or ask Claude to make an app.")); return; }
+  for (const [type, label] of GROUPS) {
+    const list = all.filter(f => f.type === type && (!q || String(f.name).toLowerCase().includes(q) || (f.type === "note" && String(f.content).toLowerCase().includes(q)))).reverse();
+    if (!list.length) continue;
+    box.append(el("div", { class: "fgroup" }, `${label} · ${list.length}`));
+    for (const f of list) {
+      const where = f.type === "note" ? (f.placed ? "on the desktop" : desk.owner.has(f.id) ? "in an app" : "in the Inbox") : f.placed ? "on the desktop" : "tucked away";
+      box.append(el("div", { class: "frow t-" + f.type }, el("i", { class: "fg" }), el("span", { class: "nm" }, f.type === "note" ? f.content : f.name), el("small", null, `${where} · ${Store.label(f.by, f.who)} · ${new Date(f.updated || f.at).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`),
+        el("span", { class: "acts" },
+          el("button", { type: "button", class: "btn sm", onclick: () => { desk.openFile(f.id); if (innerWidth < 700) $("drawer").hidden = true; } }, f.placed ? "Show" : f.type === "note" ? "Place" : "Open"),
+          el("button", { type: "button", class: "btn sm ghost", "aria-label": "Delete " + f.name, onclick: () => removeFile(f.id) }, "Delete"))));
+    }
+  }
+}
+$("files-search").addEventListener("input", renderFiles);
+$("files-search").addEventListener("keydown", e => e.stopPropagation());
+$("files-new").addEventListener("click", e => { const r = e.currentTarget.getBoundingClientRect(); openMenu(newItems(null), r.left - 120, r.bottom + 6); });
+const OPS = { act: "Did", undo: "Undo", run: "Ran", undone: "Undone", capture: "Captured", create: "Created", edit: "Edited", move: "Moved", place: "Placed", link: "Linked", done: "Done", reopen: "Reopened", delete: "Deleted", restore: "Restored", arrange: "Arranged", program: "Program", chat: "Chat", rename: "Renamed", tuck: "Tucked away", open: "Opened" };
+let logBy = "all";
+function renderLog() {
+  const me = Store.me.id, mineEv = e => e.by === "you" && (!e.who || e.who === me), ul = $("log-list");
+  const evs = Store.events.filter(e => logBy === "all" || (logBy === "you" ? mineEv(e) : logBy === "people" ? e.by === "you" && !mineEv(e) : e.by !== "you"));
+  $("log-count").textContent = Store.events.length || "";
+  ul.replaceChildren();
+  if (!evs.length) { ul.append(el("li", { class: "d-empty" }, logBy === "people" ? "Nobody else has changed anything here yet. Share this computer from its Share menu to work on it together." : "Nothing yet. Everything that happens on this desktop lands here: captures, files, edits, moves, links, programs and chat, by everyone here and by every Claude.")); return; }
+  let day = "", cursorShown = false; const cur = Store.cursor && Store.cursor.at;
+  for (const e of evs.slice(0, 300)) {
+    if (cur && !cursorShown && e.at <= cur) { cursorShown = true; ul.append(el("li", { class: "cursor" }, Store.me.id ? "Your Claude has read everything below" : "Claude in the chat has read everything below")); }
+    const d = new Date(e.at), dk = d.toDateString();
+    if (dk !== day) { day = dk; ul.append(el("li", { class: "day" }, new Date().toDateString() === dk ? "Today" : d.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "short" }))); }
+    const li = el("li", { class: "ev", tabindex: "0" }, el("time", { datetime: d.toISOString() }, `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`), el("span", { class: "op " + (e.by || "") }, (OPS[e.op] || e.op) + (e.op === "capture" && e.kind ? " " + e.kind : "")), el("span", { class: "tx" }, e.text || "", el("small", null, " · ", e.who ? face(e.who, { cls: "xs" }) : null, " " + Store.label(e.by, e.who))));
+    if (Store.canUndo(e)) li.append(el("button", { type: "button", class: "btn sm ghost undo", title: "Undo this change by Claude", onclick: ev => { ev.stopPropagation(); if (Store.undo(e)) toast("Undone."); } }, "Undo"));
+    if (e.ref && Store.files.has(e.ref)) { li.addEventListener("click", () => desk.openFile(e.ref)); li.addEventListener("keydown", ev => { if (ev.key === "Enter") desk.openFile(e.ref); }); }
+    ul.append(li);
+  }
+}
+document.querySelectorAll("#log-filter button").forEach(b => b.addEventListener("click", () => { logBy = b.dataset.by; document.querySelectorAll("#log-filter button").forEach(x => x.setAttribute("aria-pressed", String(x === b))); renderLog(); }));
+$("copy-log").addEventListener("click", async () => { const txt = Store.events.slice().reverse().map(e => `${new Date(e.at).toLocaleString()} · ${Store.label(e.by, e.who)} · ${OPS[e.op] || e.op}: ${e.text}`).join("\n"); try { await navigator.clipboard.writeText(txt); toast("Log copied as text."); } catch (e) { toast("The browser blocked copying here."); } });
+
+/* ---------- the Book ---------- */
+const escH = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function mdInline(s) {
+  s = escH(s); const codes = []; s = s.replace(/`([^`]+)`/g, (_, a) => { codes.push(a); return "\u0000" + (codes.length - 1) + "\u0000"; });
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[^\w*])\*([^*\n]+)\*(?=[^\w*]|$)/g, "$1<em>$2</em>").replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, t, u) => /^https?:/.test(u) ? `<a href="${u}" target="_blank" rel="noopener">${t}</a>` : t);
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
+}
+function mdRender(src) {
+  const out = document.createDocumentFragment(), lines = src.split("\n"), para = []; let i = 0;
+  const flush = () => { if (para.length) { const p = el("p"); p.innerHTML = mdInline(para.join(" ")); out.appendChild(p); para.length = 0; } };
+  while (i < lines.length) {
+    const l = lines[i]; let m;
+    if ((m = /^(`{3,})(.*)$/.exec(l))) {
+      flush(); const fence = m[1], lang = m[2].trim(), buf = []; i++;
+      while (i < lines.length && lines[i].trim() !== fence) buf.push(lines[i++]); i++;
+      const code = buf.join("\n"), pre = el("pre"); pre.innerHTML = lang === "tanke" || lang === "js" || lang === "program" ? T.highlight(code) : escH(code);
+      const block = el("div", { class: "codeblock" }, pre);
+      if (lang === "program") block.append(el("div", { class: "bar" }, el("span", null, "runnable program"), el("button", { class: "btn sm primary", type: "button", onclick: () => { programFromCode(code + "\n", null, "you"); if (innerWidth < 900) $("drawer").hidden = true; } }, "Open as program")));
+      if (lang === "tanke") block.append(el("div", { class: "bar" }, el("span", null, "runnable"), el("button", { class: "btn sm primary", type: "button", onclick: () => { appFromCode(code + "\n", null, "you"); if (innerWidth < 900) $("drawer").hidden = true; } }, "Open as app")));
+      out.appendChild(block); continue;
+    }
+    if ((m = /^(#{1,3})\s+(.*)/.exec(l))) { flush(); const h = el("h" + m[1].length); h.innerHTML = mdInline(m[2]); out.appendChild(h); i++; continue; }
+    if (/^>\s?/.test(l)) { flush(); const buf = []; while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, "")); const q = el("blockquote"); q.innerHTML = mdInline(buf.join(" ")); out.appendChild(q); continue; }
+    if (/^\|/.test(l)) {
+      flush(); const rows = []; while (i < lines.length && /^\|/.test(lines[i])) rows.push(lines[i++]);
+      const cells = r => r.replace(/^\||\|\s*$/g, "").split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, "|"));
+      const t = el("table"), thead = el("thead", null, el("tr", null, ...cells(rows[0]).map(h => { const th = el("th"); th.innerHTML = mdInline(h); return th; })));
+      const tb = el("tbody"); rows.slice(2).forEach(r => tb.appendChild(el("tr", null, ...cells(r).map(c => { const td = el("td"); td.innerHTML = mdInline(c); return td; }))));
+      t.append(thead, tb); out.appendChild(t); continue;
+    }
+    if (/^(\s*)([-*]|\d+\.)\s+/.test(l)) {
+      flush(); const list = el(/^\s*\d+\./.test(l) ? "ol" : "ul");
+      while (i < lines.length && /^(\s*)([-*]|\d+\.)\s+/.test(lines[i])) { let text = lines[i].replace(/^(\s*)([-*]|\d+\.)\s+/, ""); i++; while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !/^(\s*)([-*]|\d+\.)\s+/.test(lines[i])) text += " " + lines[i++].trim(); const li = el("li"); li.innerHTML = mdInline(text); list.appendChild(li); }
+      out.appendChild(list); continue;
+    }
+    if (!l.trim()) { flush(); i++; continue; }
+    para.push(l.trim()); i++;
+  }
+  flush(); return out;
+}
+let CHAPTERS = [], chapter = 0;
+function loadBook() {
+  CHAPTERS = DOCS.split(/\n(?=# )/).map(p => p.trim()).filter(p => /^# /.test(p)).map(p => ({ title: p.match(/^# (.*)/)[1], md: p }));
+  if (!CHAPTERS.length) CHAPTERS = [{ title: "Book", md: "# Book\n\nThe book is loading. If it does not appear, reload the page." }];
+  chapter = Math.max(0, Math.min(local.get("chapter", 0), CHAPTERS.length - 1));
+  $("book-chapter").replaceChildren(...CHAPTERS.map((c, i) => el("option", { value: i }, c.title)));
+  if (!$("drawer").hidden && drawerTab === "book") renderChapter(chapter);
+}
+function renderChapter(i) {
+  chapter = Math.max(0, Math.min(CHAPTERS.length - 1, i)); local.set("chapter", chapter);
+  const book = $("book"); book.replaceChildren(mdRender(CHAPTERS[chapter].md));
+  const nav = el("div", { style: "display:flex;gap:8px;margin-top:28px;flex-wrap:wrap" });
+  if (chapter > 0) nav.append(el("button", { class: "btn", type: "button", onclick: () => renderChapter(chapter - 1) }, "‹ " + CHAPTERS[chapter - 1].title));
+  nav.append(el("span", { class: "grow" }));
+  if (chapter < CHAPTERS.length - 1) nav.append(el("button", { class: "btn primary", type: "button", onclick: () => renderChapter(chapter + 1) }, CHAPTERS[chapter + 1].title + " ›"));
+  book.append(nav); $("book-chapter").value = chapter; $("panel-book").scrollTop = 0;
+}
+loadBook();
+if (!DOCS) fetch("book.md").then(r => r.ok ? r.text() : Promise.reject(r.status)).then(t => { DOCS = t.replace(/^\n/, ""); loadBook(); }).catch(() => {});
+$("book-chapter").addEventListener("change", e => renderChapter(Number(e.target.value)));
+$("book-prev").addEventListener("click", () => renderChapter(chapter - 1));
+$("book-next").addEventListener("click", () => renderChapter(chapter + 1));
+
+/* ---------- settings ---------- */
+function openSettings() {
+  $("s-desk").value = Store.desk().title || ""; $("s-prefer").value = settings.prefer; $("s-akey").value = settings.akey; $("s-amodel").value = settings.amodel; $("s-obase").value = settings.obase; $("s-okey").value = settings.okey; $("s-omodel").value = settings.omodel;
+  $("s-builtin-note").textContent = (sample ? "Claude built in is available here. " : "Claude built in is not available in this view. ") + "The canvas agent tries it first, then the Anthropic API, then any OpenAI-compatible endpoint.";
+  $("s-follow").checked = settings.follow !== false;
+  $("s-dev").checked = T.devMode();
+  $("s-memory-note").textContent = Store.mode === "db" ? `${Store.files.size} files and ${Store.events.length} log entries, kept in this artifact's database. Claude in the conversation reads a summary this page keeps current and writes its turns as text that the page plays in${Store.cursor ? `; it last read the desktop ${new Date(Store.cursor.at).toLocaleString()}` : ""}. Everyone you share this computer with sees it, live${Store.me.id ? "; your Claude has a channel of its own that only you can read" : ""}.` : `${Store.files.size} files in this browser only (this copy runs outside Claude).`;
+  $("settings").showModal();
+}
+$("settings").addEventListener("close", () => {
+  Object.assign(settings, { follow: $("s-follow").checked, prefer: $("s-prefer").value, akey: $("s-akey").value.trim(), amodel: $("s-amodel").value.trim(), obase: $("s-obase").value.trim(), okey: $("s-okey").value.trim(), omodel: $("s-omodel").value.trim() });
+  // keys stay in memory: apps on a shared desktop run in this page and could read them from storage
+  local.set("settings", Object.assign({}, settings, { akey: "", okey: "" })); lastModel = null; renderModel();
+  const t = $("s-desk").value.trim(); if (t && t !== Store.desk().title) Store.updateDesk({ title: t });
+  if ($("s-dev").checked !== T.devMode()) { try { localStorage.setItem("cc.dev", $("s-dev").checked ? "1" : "0"); } catch (e) {} for (const [, o] of desk.objs) o.el.remove(); desk.objs.clear(); for (const [, a] of desk.apps) a.sig = null; desk.sync(); }
+});
+$("sync-dot").addEventListener("click", openSettings);
+
+/* ---------- store → screen ---------- */
+let fitted = false, syncT = null;
+/* whether this page is in the live room: without it, nobody sees its pointer and it sees nobody's */
+const liveStatus = { room: "starting", connected: null, seen: 0 };
+function renderLive() {
+  const off = liveStatus.room !== "connected" && liveStatus.room !== "connecting" && liveStatus.room !== "starting" || liveStatus.connected === false;
+  const b = $("live-off"); if (b) { b.hidden = !off; b.title = `Live presence is off in this view (${liveStatus.connected === false ? "disconnected" : liveStatus.room}). Others cannot see your pointer here, and you cannot see theirs. Open it in the Claude app, or on claude.ai signed in.`; }
+}
+function renderChrome() {
+  $("desk-name").textContent = Store.desk().title || "CC3"; $("menu-btn").setAttribute("aria-label", `Menu · ${Store.desk().title || "CC3"}`);
+  $("first").hidden = !(Store.ready && Store.files.size === 0 && !liveState.turn && !desk.drafts.size);
+  const s = $("sync-dot"); s.className = Store.mode === "db" ? "live" : Store.mode === "local" ? "local" : "";
+  s.title = Store.mode === "db" ? "Shared with Claude: files live in this artifact's database" : Store.mode === "local" ? "This browser only" : "Starting…";
+}
+let mergedToastAt = 0, peopleSyncT = null;
+Store.on(what => {
+  if (what === "files" || what === "desk" || what === "desks") {
+    clearTimeout(syncT); syncT = setTimeout(() => {
+      desk.sync(); placeSelbar(true); peopleAfterSync(); emit("files", Store.list());
+      if (!fitted && Store.ready) { fitted = true; const cam = local.get("cam." + Store.deskId, null); if (cam) { Object.assign(desk.cam, cam); desk.applyCam(); } else setTimeout(() => desk.fit(), 30); }
+      if (!$("drawer").hidden && drawerTab === "files") renderFiles();
+    }, 16);
+  }
+  if (what === "events" && !$("drawer").hidden && drawerTab === "log") { clearTimeout(renderLog.t); renderLog.t = setTimeout(renderLog, 120); }
+  if (what === "events" && !chat.msgs.length && !$("messages").childElementCount) {
+    const past = Store.events.filter(e => e.op === "chat").slice(0, 12).reverse();
+    if (past.length) past.forEach(e => { const role = e.by === "you" ? "you" : e.by === "claude" ? "claude" : "agent"; const li = el("li", { class: "msg " + role }, el("div", { class: "who" }, Store.label(e.by, e.who)), el("div", { class: "body" }, e.text)); $("messages").append(li); if (role !== "claude") chat.msgs.push({ role, text: e.text }); });
+  }
+  if (what === "live") renderChatLive();
+  if (what === "turns" || (what === "files" && !turnBusy && Store.turns.some(t => !t.applied))) pumpTurns();
+  if (what === "turns") scheduleView();
+  if (what === "files" || what === "events" || what === "cursor" || what === "desk") scheduleView();
+  if (what === "files" && Store.live && Store.live.state && Store.live.state !== "idle") { clearTimeout(renderChatLive.t); renderChatLive.t = setTimeout(renderChatLive, 60); }
+  if (what === "events" || what === "cursor") { clearTimeout(renderUnread.t); renderUnread.t = setTimeout(renderUnread, 100); }
+  if (what === "cursor" && !$("drawer").hidden && drawerTab === "log") renderLog();
+  if (what === "error") toast("Couldn't save to the shared store: " + (Store.lastError || "unknown error") + ".");
+  // people: marks redraw the built-in apps; names and faces arrive after ids
+  if (what === "marks" || what === "people" || what === "trust") { clearTimeout(peopleSyncT); peopleSyncT = setTimeout(() => { desk.sync(); placeSelbar(false); peopleAfterSync(); }, 30); }
+  if (what === "people" || what === "me") { rebuildPeople(); facesSig = ""; marksSig = ""; drawFaces(); if (!$("drawer").hidden) openDrawer(drawerTab); emit("people", peopleNow()); }
+  if (what === "marks") scheduleView();
+  if (what === "me") { sharePresence(); renderPending(); if ($("view-only")) $("view-only").hidden = Store.me.canWrite !== false; }
+  if (what === "merged") { const now = Date.now(); if (now - mergedToastAt > 60000) { mergedToastAt = now; toast("Someone changed this at the same moment as you. Both changes are kept."); } }
+  renderChrome();
+});
+document.addEventListener("keydown", e => {
+  if (e.target.closest("textarea, input, select, [contenteditable]")) return;
+  if (e.key === "/" || (e.key === "k" && (e.metaKey || e.ctrlKey))) { e.preventDefault(); prompt.focus(); }
+});
+
+/* ==========================================================================
+   WINDOW API · everything a person can do, a script can do
+   ========================================================================== */
+const pub = f => f ? JSON.parse(JSON.stringify(f)) : null;
+window.tanke = window.computer = {
+  version: "3.0",
+  /** The view a Claude in a chat reads, built now: "mine" (this person's Claude) or "shared". */
+  view: kind => buildView(kind),
+  /** Who is at this page: { id, name, color, avatar, isMe }. */
+  me: () => pub(meNow()),
+  /** Everyone on this desktop now, this page's person first. */
+  people: () => pub(peopleNow()),
+  /** Go to where someone is (a peer label from people()), or follow them; follow(null) stops. */
+  goTo: peer => goTo(peer),
+  follow: peer => { if (peer) startFollowing(peer); else stopFollowing(); },
+  /** What each person did on a scope (a built-in app's data file id, or "a_<appId>_<key>"): [{ id, v, at, isMe }]. */
+  marks: scopeOrFileId => pub(Store.marksFor(Store.files.has(scopeOrFileId) ? Store.markScope("f", scopeOrFileId) : scopeOrFileId)),
+  /** Where this page's Claude reads and writes: { kind, view, turns }. */
+  channel: () => pub(Store.channel()),
+  /** Play text in the block format as a turn from Claude in the chat. → Promise */
+  turn: text => playTurn("local-" + Date.now().toString(36), String(text || ""), 0),
+  /** Apply text in the stream format (@@doc Name …), as Claude would. → { prose, results } */
+  stream(text, opts) { opts = opts || {}; const r = new Run({ prefix: "api" + (++chat.n) + ":", commit: true, by: opts.by || "agent", who: opts.by === "claude" ? "Claude · chat" : "Claude · canvas" }); r.update(String(text || ""), true); r.end(); return { prose: r.prose, results: r.results }; },
+  /** Parse the stream format without applying it. */
+  parse: text => T.parseStream(String(text || ""), true),
+  /** What each Claude is doing now; chat-Claude's live document. */
+  live: () => ({ chat: pub(Store.live), canvas: liveState.canvas ? { what: liveState.canvas.what } : null }),
+  /** How far Claude in the chat has read, and what it has not seen yet. */
+  cursor: () => pub(Store.cursor), unread: () => unreadForClaude().map(pub),
+  programs: {
+    /** Run a program by name or id. → Promise<{ ok, value, error, line }> */
+    run: (nameOrId, input, by) => { const f = Store.files.get(nameOrId) || Store.byName(nameOrId, "program"); return f ? desk.runner.run(f.id, { input, by: by || "you" }) : Promise.resolve({ ok: false, error: "No such program." }); },
+    stop: nameOrId => { const f = Store.files.get(nameOrId) || Store.byName(nameOrId, "program"); if (f) desk.runner.stop(f.id); },
+    check: code => T.checkProgram(code),
+    running: () => Store.list().filter(f => f.type === "program" && desk.runner.running(f.id)).map(f => f.name),
+  },
+  undo: eventId => { const ev = Store.events.find(e => e.id === eventId); return ev ? Store.undo(ev) : false; },
+  export: () => exportDesk(),
+  /** Compile a program without touching the desktop. → { ok, errors, warnings, ir } */
+  check(code) { const c = T.compile(String(code), {}); return { ok: !c.errors.length, errors: c.errors.map(e => e.toJSON()), warnings: c.warnings, ir: c.ir }; },
+  files: {
+    list: filter => Store.list().filter(f => !filter || Object.entries(filter).every(([k, v]) => f[k] === v)).map(pub),
+    get: (idOrName, type) => pub(Store.files.get(idOrName) || Store.byName(idOrName, type)),
+    create: (f, by) => pub(Store.add(Object.assign({ placed: f.type !== "note" }, f), by || "you")),
+    update: (id, patch, by) => pub(Store.update(id, patch, by || "you")),
+    remove: (id, by) => !!Store.remove(id, by || "you"),
+    open: id => desk.openFile(id),
+  },
+  /** Capture a note. Prefixes (? ! = [] > @) and #tags work. */
+  capture(text, opts) { opts = opts || {}; const p = T.parseCapture(text); return pub(Store.add(Object.assign({ type: "note", content: p.text, kind: opts.kind || p.kind, tags: p.tags.concat(opts.tags || []), done: p.done, placed: typeof opts.x === "number", x: opts.x || 0, y: opts.y || 0 }, p.url ? { url: p.url } : {}), opts.by || "you")); },
+  apps: {
+    list: () => Store.list().filter(f => f.type === "app").map(f => ({ id: f.id, name: f.name, placed: f.placed, ok: !!(desk.apps.get(f.id) && desk.apps.get(f.id).good), errors: desk.apps.get(f.id) ? desk.apps.get(f.id).compiled.errors.map(e => e.toJSON()) : [] })),
+    create: (code, name, by) => { const c = T.compile(String(code), {}); if (c.errors.length) return { ok: false, errors: c.errors.map(e => e.toJSON()) }; return { ok: true, file: pub(appFromCode(String(code), name, by)) }; },
+    getIR: id => { const a = desk.apps.get(id); return a && a.good ? JSON.parse(JSON.stringify(a.good.ir)) : null; },
+    setParam: (id, name, value) => setParam(id, name, value),
+  },
+  desks: { list: () => [...Store.desks.values()].map(pub), current: () => Object.assign({ id: Store.deskId }, pub(Store.desk())), create: (title, by) => Store.createDesk(title, by || "you"), switch: id => switchDesk(id), rename: title => Store.updateDesk({ title }) },
+  events: n => Store.events.slice(0, n || 50).map(pub),
+  ask: text => ask(text),
+  model: () => ({ active: lastModel || (providers()[0] && providers()[0].label) || null, chain: providers().map(p => p.label), builtin: !!sample }),
+  fit: () => desk.fit(), select: id => desk.select(id), openDrawer: tab => openDrawer(tab),
+  examples: () => EXAMPLES.map(x => ({ id: x.id, title: x.title, code: x.code })),
+  docs: () => DOCS,
+  store: () => ({ mode: Store.mode, desk: Store.deskId, files: Store.files.size, events: Store.events.length }),
+  on(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); return () => (listeners[ev] = listeners[ev].filter(f => f !== fn)); },
+};
+T.desk = desk;
+
+/* ---------- boot ---------- */
+applyTheme(local.get("theme", "auto"));
+const placeholder = () => { prompt.placeholder = innerWidth < 520 ? "Capture, or ask Claude…" : "Capture a thought, or ask Claude to make something…"; };
+placeholder(); addEventListener("resize", placeholder);
+renderChrome(); renderModel();
+const hashDesk = (/^#d-([A-Za-z0-9_-]{1,64})$/.exec(location.hash) || [])[1] || null;
+Store.init(hashDesk).then(() => { renderChrome(); });
+(async () => { try { if (window.claude && typeof window.claude.use === "function") sample = await window.claude.use("sample"); } catch (e) { sample = null; } sampleChecked = true; renderModel(); })();
+(async () => {
+  if (!(window.claude && typeof window.claude.use === "function")) return;
+  const [r, d] = await Promise.all([window.claude.use("room").catch(() => null), window.claude.use("downloads").catch(() => null)]);
+  room = r; downloads = d;
+  if (!room) { liveStatus.room = "not available in this view"; renderLive(); }
+  if (room) {
+    // people: everyone else with this computer open, live
+    liveStatus.room = "connecting";
+    room.onPeers(ch => { if (liveStatus.room !== "connected") { liveStatus.room = "connected"; liveStatus.since = Date.now(); renderLive(); } liveStatus.seen = ch.peers.length; onPeers(ch); }, e => { liveStatus.room = "stopped: " + ((e && e.code) || "error"); renderLive(); });
+    if (typeof room.onConnection === "function") room.onConnection(c => { liveStatus.connected = c; renderLive(); }, () => {});
+    await refreshSendState(); sharePresence(); addEventListener("focus", refreshSendState); setInterval(refreshSendState, 60000);
+    setInterval(() => { if (peers.length) drawPeople(); }, 5000); // idle pointers fade
+  }
+})();
+})();
